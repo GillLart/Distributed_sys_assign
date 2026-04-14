@@ -186,7 +186,38 @@ class RaftNode:
 
     def start_election(self):
         # TODO: Implement election start
-        pass
+        self.current_term += 1
+        self.role = CANDIDATE
+        self.voted_for = self.node_id
+        self.votes_received = {self.node_id}  # Vote for self
+        self.leader_id = None
+
+        print(f"[{self.node_id}] Starting election for term {self.current_term}")
+
+        last_index = self._get_last_log_index()
+        last_term = self._get_last_log_term()   
+
+        for node_id in NODE_IDS:
+            # so request isn't sent to self
+            if node_id == self.node_id:
+                continue
+            msg = {
+                "type": MSG_REQUEST_VOTE,
+                "src": self.node_id,
+                "dst": node_id,
+                "term": self.current_term,
+                "last_log_index": last_index,
+                "last_log_term": last_term,
+            }
+            #for debugging purposes, print the message being sent
+            print(
+                f"[{self.node_id}] Sending REQUEST_VOTE to {node_id} "
+                # last index and last term should currently always be 0 as log appends haven't been implimented
+                f"term={self.current_term} last_index={last_index} last_term={last_term}"
+            )
+            #send message to other nodes through the network router
+            self._send(msg)
+        #pass
 
     def handle_request_vote(self, msg):
         # TODO: Implement vote handling
@@ -194,6 +225,7 @@ class RaftNode:
 
     def handle_request_vote_response(self, msg):
         # TODO: Implement vote response handling
+        print(f"[{self.node_id}] Received vote from {msg['src']} granted={msg['vote_granted']}")
         pass
 
     # RAFT LOG REPLICATION
