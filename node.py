@@ -221,7 +221,40 @@ class RaftNode:
 
     def handle_request_vote(self, msg):
         # TODO: Implement vote handling
-        pass
+
+        if msg['term'] > self.current_term:
+            self.current_term = msg['term']
+            self.role = FOLLOWER
+            self.voted_for = None # Reset vote for the new term
+
+        # If had not voted yet or already voted for a specfic candidate 
+        if msg['term'] == self.current_term and (self.voted_for is None or self.voted_for == msg['src']):
+            # Grant the vote
+            self.voted_for = msg['src']
+            print(f"[{self.node_id}] Voting FOR {msg['src']} in term {self.current_term} ")
+        
+            # Success response
+            response = {
+                "type": MSG_REQUEST_VOTE_RESPONSE,
+                "src": self.node_id,
+                "dst": msg['src'],
+                "term": self.current_term,
+                "vote_granted": True
+            }
+        else:
+            # Reject the vote
+            print(f"[{self.node_id}] Rejecting vote for {msg['src']} in term {self.current_term}")
+
+            response = {
+                "type": MSG_REQUEST_VOTE_RESPONSE,
+                "src": self.node_id,
+                "dst": msg['src'],
+                "term": self.current_term,
+                "vote_granted": False
+            }
+
+        self._send(response)
+
 
     def handle_request_vote_response(self, msg):
         # TODO: Implement vote response handling
