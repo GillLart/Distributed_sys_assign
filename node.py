@@ -220,7 +220,6 @@ class RaftNode:
         #pass
 
     def handle_request_vote(self, msg):
-        # TODO: Implement vote handling
 
         if msg['term'] > self.current_term:
             self.current_term = msg['term']
@@ -257,9 +256,26 @@ class RaftNode:
 
 
     def handle_request_vote_response(self, msg):
-        # TODO: Implement vote response handling
+        # To care about the votes, make sure are candiate
+        if self.role != CANDIDATE:
+            return
+        
+        # Only count the vote if it's for the current election year
+        if  msg['term'] == self.current_term and msg['vote_granted']:
+            self.votes_received.add(msg['src'])
+
+            print(f"[{self.node_id}] Vote recieved from {msg['src']}. Total votes: {len(self.votes_received)}")
+        
+        # Calculate majority
+        total_nodes = len(NODE_IDS)
+        majority_votes = (total_nodes // 2) + 1
+
+        # Finding out the newly appointed leader
+        if len(self.votes_received) >= majority_votes:
+            self.role = LEADER
+            print(f"[{self.node_id}] I am now the LEADER for term {self.current_term}")
+
         print(f"[{self.node_id}] Received vote from {msg['src']} granted={msg['vote_granted']}")
-        pass
 
     # RAFT LOG REPLICATION
 
