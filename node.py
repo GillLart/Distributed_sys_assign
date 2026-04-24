@@ -300,7 +300,27 @@ class RaftNode:
 
     def handle_append_entries(self, msg):
         # TODO: Implement AppendEntries handling
-        pass
+        with self.lock:
+            if msg['term'] < self.current_term:
+                # set the responce to false if term is outdated
+                response = {
+                    "type": MSG_APPEND_ENTRIES_RESPONSE,
+                    "src": self.node_id,    
+                    "dst": msg['src'],
+                    "term": self.current_term,
+                    "success": False
+                }
+            else:
+                # handle append entries
+                self.leader_id = msg['src']
+                response = {
+                    "type": MSG_APPEND_ENTRIES_RESPONSE,
+                    "src": self.node_id,
+                    "dst": msg['src'],
+                    "term": self.current_term,
+                    "success": True
+                }
+        self._send(response)
 
     def handle_append_entries_response(self, msg):
         # TODO: Implement AppendEntries response handling
