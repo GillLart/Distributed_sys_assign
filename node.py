@@ -53,6 +53,7 @@ class RaftNode:
         self.node_id = node_id
         self.sock = None
         self.lock = threading.Lock()
+        self.sequence_number = 0
 
         # === Raft Persistent State ===
         self.current_term = 0
@@ -281,7 +282,21 @@ class RaftNode:
 
     def send_heartbeats(self):
         # TODO: Implement heartbeats / log replication
-        pass
+
+        for peer_id in NODE_IDS:
+            if peer_id != self.node_id:
+                msg = {
+                "type": MSG_APPEND_ENTRIES,
+                "src": self.node_id,
+                "dst": peer_id,
+                "term": self.current_term,
+                "entries": [],
+                "timestamp": time.time(),
+                "sequence": self.sequence_number
+                }
+                self._send(msg)
+            self.sequence_number += 1
+        
 
     def handle_append_entries(self, msg):
         # TODO: Implement AppendEntries handling
@@ -289,6 +304,10 @@ class RaftNode:
 
     def handle_append_entries_response(self, msg):
         # TODO: Implement AppendEntries response handling
+        self.send_heartbeats()
+
+        if msg['term'] > self.current_term:
+            self.role = FOLLOWER
         pass
 
     # CLIENT REQUEST HANDLING
