@@ -300,6 +300,7 @@ class RaftNode:
 
     def handle_append_entries(self, msg):
         # TODO: Implement AppendEntries handling
+        # Check that the previous log entry matches (same index and term) before accepting new entries. If the check fails, respond with `success=False`. If it passes, append the new entries to the log and update `commit_index` if the leader's commit index is higher (from breif))
         with self.lock:
             if msg['term'] < self.current_term:
                 # set the responce to false if term is outdated
@@ -324,6 +325,9 @@ class RaftNode:
 
     def handle_append_entries_response(self, msg):
         # TODO: Implement AppendEntries response handling
+        # part 1 doesnt have anything for this method put the next oats will
+        # could add a print the response for debugging purposes?
+        # part 3 will need to handle log replication and commit index updates here
         self.send_heartbeats()
 
         if msg['term'] > self.current_term:
@@ -334,7 +338,43 @@ class RaftNode:
 
     def handle_client_request(self, msg):
         # TODO: Implement client request handling
-        pass
+        #For now, operations do not go through the Raft log, it will be done in part 3 (following the brief)
+        #For now, just respond to the client for debugging purposes 
+        if self.role != LEADER:
+            # Redirect client to the current leader if not the leader
+            response = make_client_response(
+                self.node_id,
+                msg['src'],
+                success=False,
+                error="Not the leader",
+                leader_hint=self.leader_id
+            )
+            self._send(response)
+            return
+        else:
+            # do a get and put operation on the kv store for debugging purposes
+            operation = msg['operation']
+            key = msg['key']    
+            value = msg['value']
+            if operation == "PUT":
+                self.kv_store[key] = value
+                response = make_client_response(
+                    self.node_id,
+                    msg['src'],
+                    request_id=msg.get("request_id"),
+                    success = True,
+                )
+            elif operation == "GET":
+                value = self.kv_store.get(key)
+                response = make_client_response(
+                    self.node_id,
+                    msg['src'],
+                    request_id=msg.get("request_id"),
+                    success=True,
+                    value=value
+                )
+            self._send(response)
+
 
     # STATE MACHINE APPLICATION
 
