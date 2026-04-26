@@ -53,7 +53,6 @@ class RaftNode:
         self.node_id = node_id
         self.sock = None
         self.lock = threading.Lock()
-        self.sequence_number = 0
 
         # === Raft Persistent State ===
         self.current_term = 0
@@ -286,9 +285,13 @@ class RaftNode:
         # Finding out the newly appointed leader
         if len(self.votes_received) >= majority_votes:
             self.role = LEADER
+            self.leader_id = self.node_id
+            self.last_heartbeat_time = time.time()
             print(f"[{self.node_id}] I am now the LEADER for term {self.current_term}")
 
         print(f"[{self.node_id}] Received vote from {msg['src']} granted={msg['vote_granted']}")
+        
+        self.send_heartbeats() # Send intial heartbeat time upon election
 
     # RAFT LOG REPLICATION
 
@@ -297,17 +300,32 @@ class RaftNode:
 
         for peer_id in NODE_IDS:
             if peer_id != self.node_id:
+                # Determine what to send
+                first_entry = self.next_index[peer_id]
+                entries_to_send = self.log[first_entry:]
+                
+                # Determine the previous point
+                prev_log_index = self.next_index[peer_id] - 1
+
+                # Have a previous entry to reference
+                if prev_log_index >= 0:
+                    prev_log_term = self.log[prev_log_index]['term']
+                else:
+                    # At the very beginning of the log
+                    prev_log_term = 0
+
                 msg = {
                 "type": MSG_APPEND_ENTRIES,
                 "src": self.node_id,
                 "dst": peer_id,
                 "term": self.current_term,
-                "entries": [],
+                "entries": entries_to_send,
                 "timestamp": time.time(),
-                "sequence": self.sequence_number
+                "log_Index": prev_log_index,
+                "log_term": prev_log_term
                 }
+                
                 self._send(msg)
-            self.sequence_number += 1
         
 
     def handle_append_entries(self, msg):
@@ -341,6 +359,8 @@ class RaftNode:
         # could add a print the response for debugging purposes?
         # part 3 will need to handle log replication and commit index updates here
         self.send_heartbeats()
+
+        self.next_index[self.peer_id] -= 1 # Incase the follower says 'no' to entries
 
         if msg['term'] > self.current_term:
             self.role = FOLLOWER
