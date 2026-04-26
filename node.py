@@ -198,23 +198,23 @@ class RaftNode:
         last_index = self._get_last_log_index()
         last_term = self._get_last_log_term()   
 
-        for node_id in NODE_IDS:
-            # so request isn't sent to self
-            if node_id == self.node_id:
-                continue
-            msg = make_request_vote(self.node_id, self.current_term, last_index, last_term)
-            #for debugging purposes, print the message being sent
-            print(
-                f"[{self.node_id}] Sending REQUEST_VOTE to {node_id} "
-                # last index and last term should currently always be 0 as log appends haven't been implimented
-                f"term={self.current_term} last_index={last_index} last_term={last_term}"
-            )
-            #send message to other nodes through the network router
-            self._send(msg)
+        msg = make_request_vote(
+            self.node_id, 
+            self.current_term, 
+            last_index, 
+            last_term)
+        #for debugging purposes, print the message being sent
+        print(
+            f"[{self.node_id}] Sending REQUEST_VOTE to {self.current_term} "
+            # last index and last term should currently always be 0 as log appends haven't been implimented
+            f"term={self.current_term} last_index={last_index} last_term={last_term}"
+        )
+        #send message to other nodes through the network router
+        self._send(msg)
         #pass
 
     def handle_request_vote(self, msg):
-
+        #thie is the version that doesn't cause a error
         if msg['term'] > self.current_term:
             self.current_term = msg['term']
             self.role = FOLLOWER
@@ -231,7 +231,7 @@ class RaftNode:
                 self.node_id,
                 msg['src'],
                 self.current_term,
-                success = True
+                True
             ) 
         else:
             # Reject the vote
@@ -241,19 +241,25 @@ class RaftNode:
                 self.node_id,
                 msg['src'],
                 self.current_term,
-                success = False
+                False
             )
 
         self._send(response)
 
 
     def handle_request_vote_response(self, msg):
+        if msg['term'] > self.current_term:
+            self.current_term = msg['term']
+            self.role = FOLLOWER
+            self.voted_for = None
+            self.leader_id = None
+            return
         # To care about the votes, make sure are candiate
         if self.role != CANDIDATE:
             return
         
         # Only count the vote if it's for the current election year
-        if  msg['term'] == self.current_term and msg['vote_granted']:
+        if  msg['term'] == self.current_term and msg['success']:
             self.votes_received.add(msg['src'])
 
             print(f"[{self.node_id}] Vote recieved from {msg['src']}. Total votes: {len(self.votes_received)}")
@@ -265,9 +271,12 @@ class RaftNode:
         # Finding out the newly appointed leader
         if len(self.votes_received) >= majority_votes:
             self.role = LEADER
+            self.leader_id = self.node_id
+            self.last_heartbeat_time = time.time()
             print(f"[{self.node_id}] I am now the LEADER for term {self.current_term}")
 
-        print(f"[{self.node_id}] Received vote from {msg['src']} granted={msg['vote_granted']}")
+            self.send_heartbeats()  # Send initial heartbeats immediately upon election
+        print(f"[{self.node_id}] Received vote from {msg['src']} granted={msg['success']}")
 
     # RAFT LOG REPLICATION
 
@@ -286,7 +295,7 @@ class RaftNode:
         # Reset election timeout when receiving a valid heartbeat. For now, you do not need to handle log entries or consistency checks (those are added in Part 2)
         # part 2: Check that the previous log entry matches (same index and term) before accepting new entries. If the check fails, respond with `success=False`. If it passes, append the new entries to the log and update `commit_index` if the leader's commit index is higher 
         with self.lock:
-            if msg['term'] < self.current_term:
+            if msg.get('term') < self.current_term:
                 # set the responce to false if term is outdated
                 response = {
                     "type": MSG_APPEND_ENTRIES_RESPONSE,
@@ -296,8 +305,14 @@ class RaftNode:
                     "success": False
                 }
             else:
-                # handle append entries
+                # # Reset election timeout when valid heartbeat recived
+                self.current_term = msg.get('term')
+                self.role = FOLLOWER
                 self.leader_id = msg['src']
+                self.last_heartbeat_time = time.time() #
+                 # Reset election timeoutis randomised so that one node times out earlier and becomes a candidite first the next election. 
+                self.election_timeout = self._random_election_timeout()
+
                 response = {
                     "type": MSG_APPEND_ENTRIES_RESPONSE,
                     "src": self.node_id,
@@ -314,7 +329,6 @@ class RaftNode:
         # Then check if any log entry has been replicated to a majority of nodes - if so, 
         # advance `commit_index` to that entry (only commit entries from the current term).
         #  For now, you can assume AppendEntries always succeeds on the perfect network (handling `success=False` with log backtracking is added in Part 3)
-        self.send_heartbeats()
 
         if msg['term'] > self.current_term:
             self.role = FOLLOWER
@@ -329,40 +343,58 @@ class RaftNode:
         # part 2:
         # PUT/DELETE: append the operation to the Raft log as a new entry instead of writing directly to kv_store. 
         # The entry will be applied later when it is committed. GET can still read directly from kv_store for now (linearisable reads are added in Part 4)
-        if self.role != LEADER:
+        #should handle multiple keys
+        #should handle a non existent key (ie if key doesnt exist should return an error message instead of None)
+        # should handle overwriting an existing key (and DELETE)(ie if key already exists and client tries to put a new value for that key, should overwrite the value instead of returning an error)   
+       
+       # if self.role != LEADER:
             # Redirect client to the current leader if not the leader
+           # response = make_client_response(
+                #self.node_id,
+                #msg['src'],  
+                #request_id=msg.get("request_id"),
+                #success=False,
+                #error="Not the leader",
+                #leader_hint=self.leader_id
+            #)
+            #self._send(response)
+            # return
+        
+        # do a get and put operation on the kv store for debugging purposes
+        operation = msg.get('operation', '').upper()
+        key = msg.get('key')  
+        if  operation == "PUT":
+            value = msg.get('value')
+            self.kv_store[key] = value
             response = make_client_response(
                 self.node_id,
                 msg['src'],
-                success=False,
-                error="Not the leader",
-                leader_hint=self.leader_id
+                request_id=msg.get("request_id"),
+                success = True,
+                value = value
             )
-            self._send(response)
-            return
-        else:
-            # do a get and put operation on the kv store for debugging purposes
-            operation = msg['operation']
-            key = msg['key']    
-            value = msg['value']
-            if operation == "PUT":
-                self.kv_store[key] = value
-                response = make_client_response(
-                    self.node_id,
-                    msg['src'],
-                    request_id=msg.get("request_id"),
-                    success = True,
-                )
-            elif operation == "GET":
-                value = self.kv_store.get(key)
+        elif operation == "GET":
+            if key in self.kv_store:
+                value = self.kv_store[key]
                 response = make_client_response(
                     self.node_id,
                     msg['src'],
                     request_id=msg.get("request_id"),
                     success=True,
-                    value=value
+                    value=self.kv_store[key]
                 )
-            self._send(response)
+                print("RESPONSE:", response)
+                self._send(response)
+            else :
+                response = make_client_response(
+                    self.node_id,
+                    msg['src'],
+                    request_id=msg.get("request_id"),
+                    success=False,
+                    error=f"Unknown operation: {msg.get('operation')}"
+                )
+        print(f"[{self.node_id}] SENDING RESPONSE:", response)
+        self._send(response)
 
 
     # STATE MACHINE APPLICATION
