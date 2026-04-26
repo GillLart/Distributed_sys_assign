@@ -164,3 +164,28 @@ def make_client_response(node_id, client_id, request_id, success,
         "leader_hint": leader_hint,
         "error": error,
     }
+
+def make_append_entries(leader_id, term, prev_log_index, prev_log_term, entries, leader_commit):
+    """
+    Create an APPEND_ENTRIES message.
+
+    Sent by the leader to other nodes to replicate log entries and as heartbeats.
+
+    Args:
+        leader_id: The leader's node ID.
+        term: The leader's current term.
+        prev_log_index: Index of the log entry immediately preceding new ones.
+        prev_log_term: Term of the prev_log_index entry.
+        entries: List of new log entries to store (empty for heartbeat).
+        leader_commit: The leader's commit index.
+    """
+    return {
+        "type": MSG_APPEND_ENTRIES,
+        "src": leader_id,
+        "dst": "all_nodes",
+        "term": term,
+        "prev_log_index": prev_log_index,
+        "prev_log_term": prev_log_term,
+        "entries": entries,
+        "leader_commit": leader_commit,
+    }
