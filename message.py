@@ -102,6 +102,16 @@ def make_register(sender_id, sender_type):
         "sender_type": sender_type,
     }
 
+def make_request_vote_response(node_id, current_term, success):
+
+    return {
+            "type": MSG_REQUEST_VOTE_RESPONSE,
+            "src": node_id,
+            "dst": "network",
+            "term": current_term,
+            "success": success
+        }
+
 
 def make_client_request(client_id, request_id, operation, key, value=None):
     """

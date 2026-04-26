@@ -7,7 +7,7 @@ import os
 import sys
 
 from message import (
-    send_message, recv_message, make_register, make_client_response,
+    send_message, recv_message, make_register, make_client_response, make_request_vote_response,
     MSG_REGISTER_ACK, MSG_APPEND_ENTRIES, MSG_APPEND_ENTRIES_RESPONSE,
     MSG_REQUEST_VOTE, MSG_REQUEST_VOTE_RESPONSE,
     MSG_CLIENT_REQUEST,
@@ -234,13 +234,12 @@ class RaftNode:
             print(f"[{self.node_id}] Voting FOR {msg['src']} in term {self.current_term} ")
         
             # Success response
-            response = {
-                "type": MSG_REQUEST_VOTE_RESPONSE,
-                "src": self.node_id,
-                "dst": msg['src'],
-                "term": self.current_term,
-                "vote_granted": True
-            }
+            response = make_request_vote_response (
+                self.node_id,
+                msg['src'],
+                self.current_term,
+                success = True
+            )
         else:
             # Reject the vote
             print(f"[{self.node_id}] Rejecting vote for {msg['src']} in term {self.current_term}")
@@ -250,7 +249,7 @@ class RaftNode:
                 "src": self.node_id,
                 "dst": msg['src'],
                 "term": self.current_term,
-                "vote_granted": False
+                "success": False
             }
 
         self._send(response)
