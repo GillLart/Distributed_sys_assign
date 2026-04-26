@@ -111,7 +111,6 @@ def make_request_vote_response(node_id, current_term, success):
             "term": current_term,
             "success": success
         }
-# HI GILLIAN!!
 
 def make_client_request(client_id, request_id, operation, key, value=None):
     """
@@ -165,27 +164,33 @@ def make_client_response(node_id, client_id, request_id, success,
         "error": error,
     }
 
-def make_append_entries(leader_id, term, prev_log_index, prev_log_term, entries, leader_commit):
-    """
-    Create an APPEND_ENTRIES message.
+def make_append_entries(node_id, peer_id, term, timestamp, sequence_number,):
 
-    Sent by the leader to other nodes to replicate log entries and as heartbeats.
-
-    Args:
-        leader_id: The leader's node ID.
-        term: The leader's current term.
-        prev_log_index: Index of the log entry immediately preceding new ones.
-        prev_log_term: Term of the prev_log_index entry.
-        entries: List of new log entries to store (empty for heartbeat).
-        leader_commit: The leader's commit index.
-    """
     return {
         "type": MSG_APPEND_ENTRIES,
-        "src": leader_id,
-        "dst": "all_nodes",
+        "src": node_id,
+        "dst": peer_id,
         "term": term,
-        "prev_log_index": prev_log_index,
-        "prev_log_term": prev_log_term,
-        "entries": entries,
-        "leader_commit": leader_commit,
+        "entries": [],
+        "timestamp": timestamp,
+        "sequence": sequence_number,
     }
+
+def make_request_vote(node_id,current_term,last_index, last_term):
+    return{
+                "type": MSG_REQUEST_VOTE,
+                "src": node_id,
+                "dst": "all_nodes",
+                "term": current_term,
+                "last_log_index": last_index,
+                "last_log_term": last_term,
+            }
+
+def make_handle_append_entries( node_id, current_term, success):
+    return {
+                "type": MSG_APPEND_ENTRIES_RESPONSE,
+                "src": node_id,
+                "dst": "network",
+                "term": current_term,
+                "success": success
+            }
