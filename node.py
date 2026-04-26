@@ -239,18 +239,17 @@ class RaftNode:
                 msg['src'],
                 self.current_term,
                 success = True
-            )
+            ) #HI GILLIAN
         else:
             # Reject the vote
             print(f"[{self.node_id}] Rejecting vote for {msg['src']} in term {self.current_term}")
 
-            response = {
-                "type": MSG_REQUEST_VOTE_RESPONSE,
-                "src": self.node_id,
-                "dst": msg['src'],
-                "term": self.current_term,
-                "success": False
-            }
+            response = make_request_vote_response (
+                self.node_id,
+                msg['src'],
+                self.current_term,
+                success = False
+            )
 
         self._send(response)
 

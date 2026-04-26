@@ -111,7 +111,7 @@ def make_request_vote_response(node_id, current_term, success):
             "term": current_term,
             "success": success
         }
-
+# HI GILLIAN!!
 
 def make_client_request(client_id, request_id, operation, key, value=None):
     """
