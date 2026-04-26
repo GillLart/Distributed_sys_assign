@@ -225,11 +225,25 @@ class RaftNode:
         if msg['term'] > self.current_term:
             self.current_term = msg['term']
             self.role = FOLLOWER
+            vote_granted = False # Reject vote
             self.voted_for = None # Reset vote for the new term
 
+            my_last_term = self._get_last_log_term
+            my_last_index = self._get_last_log_index
+
+            candidate_last_term = msg['last_log_term']
+            candidate_last_index = msg['last_log_index']
+
+            # Checking for higher term, then if equal term checking for longer index
+            log_check = (candidate_last_term > my_last_term) or \
+            (candidate_last_term == my_last_term) and (candidate_last_index >= my_last_index)
+
+
         # If had not voted yet or already voted for a specfic candidate 
-        if msg['term'] == self.current_term and (self.voted_for is None or self.voted_for == msg['src']):
+        if msg['term'] == self.current_term and (self.voted_for is None or self.voted_for == msg['src']) and \
+        log_check:
             # Grant the vote
+            vote_granted = True
             self.voted_for = msg['src']
             print(f"[{self.node_id}] Voting FOR {msg['src']} in term {self.current_term} ")
         
@@ -238,8 +252,8 @@ class RaftNode:
                 self.node_id,
                 msg['src'],
                 self.current_term,
-                success = True
-            ) #HI GILLIAN
+                success = vote_granted
+            )
         else:
             # Reject the vote
             print(f"[{self.node_id}] Rejecting vote for {msg['src']} in term {self.current_term}")

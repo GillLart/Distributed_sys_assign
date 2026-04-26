@@ -111,7 +111,19 @@ def make_request_vote_response(node_id, current_term, success):
             "term": current_term,
             "success": success
         }
-# HI GILLIAN!!
+
+def make_append_entries(node_id, current_term, entries, timestamp, sequence):
+
+    return {
+            "type": MSG_APPEND_ENTRIES,
+            "src": node_id,
+            "dst": "network",
+            "term": current_term,
+            "entries" : entries,
+            "timestamp" : timestamp,
+            "sequence": sequence
+        }
+
 
 def make_client_request(client_id, request_id, operation, key, value=None):
     """
