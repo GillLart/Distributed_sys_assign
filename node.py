@@ -373,8 +373,9 @@ class RaftNode:
 
             # check previous log entry matches
             if prev_log_index > 0:
-                local_prev_term = self._get_log_term(prev_log_index)
-                if local_prev_term != prev_log_term:
+                # also addched check for if follower log is empty
+                local_prev_entry = self._get_log_entry(prev_log_index)
+                if local_prev_entry is None or local_prev_entry != prev_log_term:
                     # Previous log entry does not match, reject the AppendEntries
                     response = {
                         "type": MSG_APPEND_ENTRIES_RESPONSE,
