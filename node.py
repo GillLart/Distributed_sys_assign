@@ -482,7 +482,35 @@ class RaftNode:
 
     def apply_committed(self):
         # TODO: Implement state machine application
-        pass
+        
+        # Loop through last applied and commit index
+        for i in range(self.last_applied + 1, self.commit_index + 1):
+            entry = self.log[i]
+            cmd = entry['command']
+
+            # Pull the data from this specific log entry
+            operation = cmd.get('operation', '').upper()
+            key = cmd.get('key')
+            value = cmd.get('value')
+
+            # Apply this entry's data to the key store
+            if operation == "PUT":
+                self.kv_store[key] = value
+            elif operation == "DELETE":
+                self.kv_store.pop(key, None)
+            
+            # If leader, send response using this entry's metadata
+            if self.role == "LEADER":
+                response = make_client_response(
+                    self.node_id,
+                    entry['client_id'], # Use the ID form the log entry
+                    request_id = entry['request_id'],
+                    success = True,
+                    value = self.kv_store(key) # Safely get the value
+                )
+                self._send(response)
+        # To update the pointer  
+        self.last_applied = self.commit_index
 
     # CHECKPOINTING / SNAPSHOTTING (Part 3)
 
