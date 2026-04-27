@@ -314,8 +314,8 @@ class RaftNode:
                 elif first_entry > len(self.log):
                     entries_to_send = []
                 else:    
-                    # -1 so that the raft index iis converted to python index (bacuse raft atarts at 1 and py at 0)
-                    entries_to_send = self.log[first_entry-1:]
+                    # -1 so that the raft index is converted to python index (bacuse raft atarts at 1 and py at 0)
+                    entries_to_send = self._get_log_slice
                 
                 # Determine the previous point
                 prev_log_index = self.next_index[peer_id] - 1
