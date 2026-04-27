@@ -490,9 +490,11 @@ class RaftNode:
             entry = {
                 "index": self._get_last_log_index() + 1,
                 "term": self.current_term,
-                "operation": operation,
-                "key": key,
-                "value": value,
+                "command":{
+                    "operation": operation,
+                    "key": key,
+                    "value": value
+                },
                 "client_id": msg['src'],
                 "request_id": msg.get("request_id")
             }
@@ -539,9 +541,11 @@ class RaftNode:
                 entry = {
                     "index": self._get_last_log_index() + 1,
                     "term": self.current_term,
-                    "operation": "DELETE",
-                    "key": key,
-                    "value": None,
+                    "command":{
+                        "operation": "DELETE",
+                        "key": key,
+                        "value": None
+                    },
                     "client_id": msg['src'],
                     "request_id": msg.get("request_id")
                 }
@@ -594,10 +598,11 @@ class RaftNode:
                 #skip
                 continue
 
+            cmd = entry.get('command', {})
             # Pull the data from this specific log entry
-            operation = entry.get('operation', '').upper()
-            key = entry.get('key')
-            value = entry.get('value')
+            operation = cmd.get('operation', '').upper()
+            key = cmd.get('key')
+            value = cmd.get('value')
 
             # Apply this entry's data to the key store
             # handling for put/ overwrites
