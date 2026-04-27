@@ -53,7 +53,6 @@ class RaftNode:
         self.node_id = node_id
         self.sock = None
         self.lock = threading.Lock()
-        self.sequence_number = 0
 
         # === Raft Persistent State ===
         self.current_term = 0
@@ -218,11 +217,25 @@ class RaftNode:
         if msg['term'] > self.current_term:
             self.current_term = msg['term']
             self.role = FOLLOWER
+            vote_granted = False # Reject vote
             self.voted_for = None # Reset vote for the new term
 
+            my_last_term = self._get_last_log_term
+            my_last_index = self._get_last_log_index
+
+            candidate_last_term = msg['last_log_term']
+            candidate_last_index = msg['last_log_index']
+
+            # Checking for higher term, then if equal term checking for longer index
+            log_check = (candidate_last_term > my_last_term) or \
+            (candidate_last_term == my_last_term) and (candidate_last_index >= my_last_index)
+
+
         # If had not voted yet or already voted for a specfic candidate 
-        if msg['term'] == self.current_term and (self.voted_for is None or self.voted_for == msg['src']):
+        if msg['term'] == self.current_term and (self.voted_for is None or self.voted_for == msg['src']) and \
+        log_check:
             # Grant the vote
+            vote_granted = True
             self.voted_for = msg['src']
             print(f"[{self.node_id}] Voting FOR {msg['src']} in term {self.current_term} ")
         
@@ -231,8 +244,8 @@ class RaftNode:
                 self.node_id,
                 msg['src'],
                 self.current_term,
-                True
-            ) 
+                success = vote_granted
+            )
         else:
             # Reject the vote
             print(f"[{self.node_id}] Rejecting vote for {msg['src']} in term {self.current_term}")
@@ -285,9 +298,32 @@ class RaftNode:
 
         for peer_id in NODE_IDS:
             if peer_id != self.node_id:
-                msg = make_append_entries(self.node_id, peer_id, self.current_term, time.time(), self.sequence_number)
+                # Determine what to send
+                first_entry = self.next_index[peer_id]
+                entries_to_send = self.log[first_entry:]
+                
+                # Determine the previous point
+                prev_log_index = self.next_index[peer_id] - 1
+
+                # Have a previous entry to reference
+                if prev_log_index >= 0:
+                    prev_log_term = self.log[prev_log_index]['term']
+                else:
+                    # At the very beginning of the log
+                    prev_log_term = 0
+
+                msg = {
+                "type": MSG_APPEND_ENTRIES,
+                "src": self.node_id,
+                "dst": peer_id,
+                "term": self.current_term,
+                "entries": entries_to_send,
+                "timestamp": time.time(),
+                "log_Index": prev_log_index,
+                "log_term": prev_log_term
+                }
+                
                 self._send(msg)
-            self.sequence_number += 1
         
 
     def handle_append_entries(self, msg):
@@ -329,6 +365,8 @@ class RaftNode:
         # Then check if any log entry has been replicated to a majority of nodes - if so, 
         # advance `commit_index` to that entry (only commit entries from the current term).
         #  For now, you can assume AppendEntries always succeeds on the perfect network (handling `success=False` with log backtracking is added in Part 3)
+
+        self.next_index[self.peer_id] -= 1 # Incase the follower says 'no' to entries
 
         if msg['term'] > self.current_term:
             self.role = FOLLOWER
