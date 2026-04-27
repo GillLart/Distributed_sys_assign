@@ -407,18 +407,13 @@ class RaftNode:
                 "src": self.node_id,
                 "dst": msg['src'],
                 "term": self.current_term,
-                "success": True
+                "success": True,
+                "match_index":self._get_last_log_index()
             }
         self._send(response)
 
     def handle_append_entries_response(self, msg):
         # TODO: Implement AppendEntries response handling
-        # part 1 doesnt have anything for this method put the next oats will
-        # part 2: On success, update `match_index` and `next_index` for that follower. 
-        # Then check if any log entry has been replicated to a majority of nodes - if so, 
-        # advance `commit_index` to that entry (only commit entries from the current term).
-        #  For now, you can assume AppendEntries always succeeds on the perfect network (handling `success=False` with log backtracking is added in Part 3)
-
         if msg['term'] > self.current_term:
             self.current_term = msg['term']
             self.role = FOLLOWER
@@ -434,8 +429,30 @@ class RaftNode:
             self.next_index[msg['src']] = max(1, self.next_index.get(msg['src'], 1) - 1)
             return
         
-        #ignoreing sucessful responses for now as the brief said to ignore log backtracking for now
-        return
+        #sucessful then followers match up to the index
+        follower_match_index = msg.get('match_index', self._get_last_log_index())
+        self.match_index[msg['src']] = follower_match_index
+        self.next_index[msg['src']] = follower_match_index + 1
+        # Check if there are any new entries that can be committed
+        for index in range(self.commit_index + 1, self._get_last_log_index() + 1):
+            entry = self._get_log_entry(index)
+            if entry is None:
+                continue
+            #only commit entries from current term
+            if entry['term'] != self.current_term:
+                continue
+            # this should be the leader's own log, so it counts as a match
+            count = 1  
+
+            for peer_id in NODE_IDS:
+                if peer_id == self.node_id:
+                    continue
+                if self.match_index.get(peer_id, 0) >= index:
+                    count += 1
+
+            if count >= (len(NODE_IDS) // 2)+1:
+                self.commit_index = index
+        self.apply_committed()
 
     # CLIENT REQUEST HANDLING
 
