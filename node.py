@@ -220,16 +220,16 @@ class RaftNode:
             vote_granted = False # Reject vote
             self.voted_for = None # Reset vote for the new term
 
-            my_last_term = self._get_last_log_term
-            my_last_index = self._get_last_log_index
+            my_last_term = self._get_last_log_term()
+            my_last_index = self._get_last_log_index()
 
             candidate_last_term = msg['last_log_term']
             candidate_last_index = msg['last_log_index']
 
             # Checking for higher term, then if equal term checking for longer index
-            log_check = (candidate_last_term > my_last_term) or \
-            (candidate_last_term == my_last_term) and (candidate_last_index >= my_last_index)
-
+            log_check = (
+            (candidate_last_term > my_last_term) or ((candidate_last_term == my_last_term) and (candidate_last_index >= my_last_index))
+            )
 
         # If had not voted yet or already voted for a specfic candidate 
         if msg['term'] == self.current_term and (self.voted_for is None or self.voted_for == msg['src']) and \
@@ -286,6 +286,14 @@ class RaftNode:
             self.role = LEADER
             self.leader_id = self.node_id
             self.last_heartbeat_time = time.time()
+            # incrament the next index for each follower to be one more than the last log index 
+            # (as the leader would try to send new entries starting from there)
+            next_log_index = self._get_last_log_index() + 1
+            for peer_id in NODE_IDS:
+                if peer_id != self.node_id:
+                    self.next_index[peer_id] = next_log_index
+                    self.match_index[peer_id] = 0
+
             print(f"[{self.node_id}] I am now the LEADER for term {self.current_term}")
 
             self.send_heartbeats()  # Send initial heartbeats immediately upon election
@@ -299,16 +307,23 @@ class RaftNode:
         for peer_id in NODE_IDS:
             if peer_id != self.node_id:
                 # Determine what to send
+                # guarding against invalid index and empty log
                 first_entry = self.next_index[peer_id]
-                entries_to_send = self.log[first_entry:]
+                if first_entry <=0:
+                    entries_to_send = self.log
+                elif first_entry > len(self.log):
+                    entries_to_send = []
+                else:    
+                    # -1 so that the raft index iis converted to python index (bacuse raft atarts at 1 and py at 0)
+                    entries_to_send = self.log[first_entry-1:]
                 
                 # Determine the previous point
                 prev_log_index = self.next_index[peer_id] - 1
 
                 # Have a previous entry to reference
                 if prev_log_index >= 0:
-                    prev_log_term = self.log[prev_log_index]['term']
-                else:
+                    prev_log_term = self._get_log_term(prev_log_index)
+                else:  
                     # At the very beginning of the log
                     prev_log_term = 0
 
@@ -366,10 +381,14 @@ class RaftNode:
         # advance `commit_index` to that entry (only commit entries from the current term).
         #  For now, you can assume AppendEntries always succeeds on the perfect network (handling `success=False` with log backtracking is added in Part 3)
 
-        self.next_index[self.peer_id] -= 1 # Incase the follower says 'no' to entries
-
         if msg['term'] > self.current_term:
             self.role = FOLLOWER
+
+        if self.role != LEADER:
+            return
+        
+        self.next_index[msg['src']] -= 1 # Incase the follower says 'no' to entries, then its behind so try for one of that nodes previous entries next time
+
         pass
 
     # CLIENT REQUEST HANDLING
