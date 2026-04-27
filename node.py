@@ -395,16 +395,16 @@ class RaftNode:
 
     def handle_client_request(self, msg):
         # TODO: Implement client request handling
-        #For now, operations do not go through the Raft log, it will be done in part 3 (following the brief)
-        #For now, just respond to the client for debugging purposes 
+        # For now, operations do not go through the Raft log, it will be done in part 3 (following the brief)
+        # For now, just respond to the client for debugging purposes 
         # part 2:
         # PUT/DELETE: append the operation to the Raft log as a new entry instead of writing directly to kv_store. 
         # The entry will be applied later when it is committed. GET can still read directly from kv_store for now (linearisable reads are added in Part 4)
-        #should handle multiple keys
-        #should handle a non existent key (ie if key doesnt exist should return an error message instead of None)
-        # should handle overwriting an existing key (and DELETE)(ie if key already exists and client tries to put a new value for that key, should overwrite the value instead of returning an error)   
+        # should handle multiple keys
        
-       # if self.role != LEADER:
+        # should handle overwriting an existing key (and DELETE)(ie if key already exists and client tries to put a new value for that key, should overwrite the value instead of returning an error)   
+        # got rid of the check for if not leader, as the brief said to ignore that for part 2 and just respond to the client for debugging purposes. The response is still sent through the network router, but it will be sent even if this node is not the leader.
+        #if self.role != LEADER:
             # Redirect client to the current leader if not the leader
            # response = make_client_response(
                 #self.node_id,
@@ -442,14 +442,38 @@ class RaftNode:
                 )
                 print("RESPONSE:", response)
                 self._send(response)
-            else :
+            else:
                 response = make_client_response(
                     self.node_id,
                     msg['src'],
                     request_id=msg.get("request_id"),
                     success=False,
-                    error=f"Unknown operation: {msg.get('operation')}"
+                    error=f"Key '{key}' not found"
                 )
+                print("RESPONSE:", response)
+                self._send(response)
+
+        elif operation == "DELETE":
+            if key in self.kv_store:
+                del self.kv_store[key]
+                response = make_client_response(
+                    self.node_id,
+                    msg['src'],
+                    request_id=msg.get("request_id"),
+                    success=True,
+                    value=None
+                )
+                print("RESPONSE:", response)
+                self._send(response)
+
+        else :
+            response = make_client_response(
+                self.node_id,
+                msg['src'],
+                request_id=msg.get("request_id"),
+                success=False,
+                error=f"Unknown operation: {msg.get('operation')}"
+            )
         print(f"[{self.node_id}] SENDING RESPONSE:", response)
         self._send(response)
 
