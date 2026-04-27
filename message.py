@@ -102,28 +102,15 @@ def make_register(sender_id, sender_type):
         "sender_type": sender_type,
     }
 
-def make_request_vote_response(node_id, current_term, success):
+def make_request_vote_response(node_id, dst,current_term, success):
 
     return {
             "type": MSG_REQUEST_VOTE_RESPONSE,
             "src": node_id,
-            "dst": "network",
+            "dst": dst,
             "term": current_term,
             "success": success
         }
-
-def make_append_entries(node_id, current_term, entries, timestamp, sequence):
-
-    return {
-            "type": MSG_APPEND_ENTRIES,
-            "src": node_id,
-            "dst": "network",
-            "term": current_term,
-            "entries" : entries,
-            "timestamp" : timestamp,
-            "sequence": sequence
-        }
-
 
 def make_client_request(client_id, request_id, operation, key, value=None):
     """
@@ -176,3 +163,34 @@ def make_client_response(node_id, client_id, request_id, success,
         "leader_hint": leader_hint,
         "error": error,
     }
+
+def make_append_entries(node_id, peer_id, term, timestamp, sequence_number,):
+
+    return {
+        "type": MSG_APPEND_ENTRIES,
+        "src": node_id,
+        "dst": peer_id,
+        "term": term,
+        "entries": [],
+        "timestamp": timestamp,
+        "sequence": sequence_number,
+    }
+
+def make_request_vote(node_id,current_term,last_index, last_term):
+    return{
+                "type": MSG_REQUEST_VOTE,
+                "src": node_id,
+                "dst": "all_nodes",
+                "term": current_term,
+                "last_log_index": last_index,
+                "last_log_term": last_term,
+            }
+
+def make_handle_append_entries( node_id, current_term, success):
+    return {
+                "type": MSG_APPEND_ENTRIES_RESPONSE,
+                "src": node_id,
+                "dst": "network",
+                "term": current_term,
+                "success": success
+            }
