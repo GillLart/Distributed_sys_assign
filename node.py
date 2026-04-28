@@ -548,7 +548,22 @@ class RaftNode:
 
     def load_state(self):
         # TODO (Part 3): Implement state loading
-        pass
+
+        # Build the file path
+        file_path = f"data/{self.node_id}.json"
+        
+        # Check if the file exists
+        if os.path.exists(file_path):
+            # Open and read the file
+            with open(file_path, 'r') as f:
+                data = json.load(f) # Turn text into a python dictionary
+        else:
+            return # Return nothing if file does not exist
+
+        # Update the variables
+        self.current_term = data.get('current_term', 0)
+        self.voted_for = data.get('voted_for')
+        self.log = data.get('log', [])
 
     # HELPER METHODS 
 
@@ -584,6 +599,7 @@ class RaftNode:
         self.role = FOLLOWER
         self.voted_for = None
         self.leader_id = None
+        self.save_state()
 
 # ENTRY POINT
 
