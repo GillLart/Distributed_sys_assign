@@ -215,10 +215,9 @@ class RaftNode:
     def handle_request_vote(self, msg):
         #thie is the version that doesn't cause a error
         if msg['term'] > self.current_term:
-            self.current_term = msg['term']
-            self.role = FOLLOWER
+            self._step_down(msg['term'])
+            self._random_election_timeout
             vote_granted = False # Reject vote
-            self.voted_for = None # Reset vote for the new term
 
             my_last_term = self._get_last_log_term()
             my_last_index = self._get_last_log_index()
@@ -262,10 +261,8 @@ class RaftNode:
 
     def handle_request_vote_response(self, msg):
         if msg['term'] > self.current_term:
-            self.current_term = msg['term']
-            self.role = FOLLOWER
-            self.voted_for = None
-            self.leader_id = None
+            self._step_down(msg['term'])
+            self._random_election_timeout
             return
         # To care about the votes, make sure are candiate
         if self.role != CANDIDATE:
@@ -347,6 +344,8 @@ class RaftNode:
         # part 2: Check that the previous log entry matches (same index and term) before accepting new entries. If the check fails, respond with `success=False`. If it passes, append the new entries to the log and update `commit_index` if the leader's commit index is higher 
         with self.lock:
             if msg.get('term') < self.current_term:
+                self._step_down(msg['term'])
+                self._random_election_timeout
                 # set the responce to false if term is outdated
                 response = {
                     "type": MSG_APPEND_ENTRIES_RESPONSE,
@@ -416,10 +415,8 @@ class RaftNode:
     def handle_append_entries_response(self, msg):
         # TODO: Implement AppendEntries response handling
         if msg['term'] > self.current_term:
-            self.current_term = msg['term']
-            self.role = FOLLOWER
-            self.voted_for = None
-            self.leader_id = None
+            self._step_down(msg['term'])
+            self._random_election_timeout
             return
 
         if self.role != LEADER:
