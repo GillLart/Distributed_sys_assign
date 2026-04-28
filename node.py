@@ -216,27 +216,27 @@ class RaftNode:
         #thie is the version that doesn't cause a error
         if msg['term'] > self.current_term:
             self._step_down(msg['term'])
-            self._random_election_timeout
-            vote_granted = False # Reject vote
+            self.election_timeout = self._random_election_timeout()
+            #vote_granted = False # Reject vote
 
-            my_last_term = self._get_last_log_term()
-            my_last_index = self._get_last_log_index()
+        my_last_term = self._get_last_log_term()
+        my_last_index = self._get_last_log_index()
 
-            candidate_last_term = msg['last_log_term']
-            candidate_last_index = msg['last_log_index']
+        candidate_last_term = msg['last_log_term']
+        candidate_last_index = msg['last_log_index']
 
-            # Checking for higher term, then if equal term checking for longer index
-            log_check = (
-            (candidate_last_term > my_last_term) or ((candidate_last_term == my_last_term) and (candidate_last_index >= my_last_index))
+        # Checking for higher term, then if equal term checking for longer index
+        log_check = (candidate_last_term > my_last_term or (
+            candidate_last_term == my_last_term and 
+            candidate_last_index >= my_last_index
             )
+        )
 
         # If had not voted yet or already voted for a specfic candidate 
-        if msg['term'] == self.current_term and (self.voted_for is None or self.voted_for == msg['src']) and \
-        log_check:
+        if msg['term'] == self.current_term and (self.voted_for is None or self.voted_for == msg['src']) and log_check:
             # Grant the vote
-            vote_granted = True
             self.voted_for = msg['src']
-            self.save_state
+            self.save_state()
             print(f"[{self.node_id}] Voting FOR {msg['src']} in term {self.current_term} ")
         
             # Success response
@@ -244,7 +244,7 @@ class RaftNode:
                 self.node_id,
                 msg['src'],
                 self.current_term,
-                success = vote_granted
+                success = True
             )
         else:
             # Reject the vote
@@ -263,7 +263,7 @@ class RaftNode:
     def handle_request_vote_response(self, msg):
         if msg['term'] > self.current_term:
             self._step_down(msg['term'])
-            self._random_election_timeout
+            self.election_timeout = self._random_election_timeout() 
             return
         # To care about the votes, make sure are candiate
         if self.role != CANDIDATE:
@@ -295,6 +295,7 @@ class RaftNode:
             print(f"[{self.node_id}] I am now the LEADER for term {self.current_term}")
 
             self.send_heartbeats()  # Send initial heartbeats immediately upon election
+            return
         print(f"[{self.node_id}] Received vote from {msg['src']} granted={msg['success']}")
 
     # RAFT LOG REPLICATION
@@ -303,40 +304,37 @@ class RaftNode:
         # TODO: Implement heartbeats / log replication
 
         for peer_id in NODE_IDS:
-            if peer_id != self.node_id:
-                # Determine what to send
-                # guarding against invalid index and empty log
-                first_entry = self.next_index[peer_id]
-                if first_entry <=0:
-                    entries_to_send = self.log
-                elif first_entry > len(self.log):
-                    entries_to_send = []
-                else:    
-                    # -1 so that the raft index is converted to python index (bacuse raft atarts at 1 and py at 0)
-                    entries_to_send = self._get_log_slice
-                
-                # Determine the previous point
-                prev_log_index = self.next_index[peer_id] - 1
+            if peer_id == self.node_id:
+                # Don't send heartbeats to self
+                continue
+            # Determine what to send
+            next_index = self.next_index.get(peer_id, 1)
+            # get the log entries from the next index onward (if any)
+            entries_to_send = self.log[next_index-1:]
+            
+            # Determine the previous point
+            prev_log_index = next_index - 1
 
-                # Have a previous entry to reference
-                if prev_log_index >= 0:
-                    prev_log_term = self._get_log_term(prev_log_index)
-                else:  
-                    # At the very beginning of the log
-                    prev_log_term = 0
+            #  previoud log term
+            if prev_log_index > 0:
+                prev_log_term = self._get_log_term(prev_log_index)
+            else:  
+                # At the very beginning of the log
+                prev_log_term = 0
 
-                msg = {
-                "type": MSG_APPEND_ENTRIES,
-                "src": self.node_id,
-                "dst": peer_id,
-                "term": self.current_term,
-                "entries": entries_to_send,
-                "timestamp": time.time(),
-                "log_Index": prev_log_index,
-                "log_term": prev_log_term
-                }
-                
-                self._send(msg)
+            msg = {
+            "type": MSG_APPEND_ENTRIES,
+            "src": self.node_id,
+            "dst": peer_id,
+            "term": self.current_term,
+            "entries": entries_to_send,
+            "timestamp": time.time(),
+            "prev_log_index": prev_log_index,
+            "prev_log_term": prev_log_term,
+            "leader_commit": self.commit_index
+            }
+            
+            self._send(msg)
         
 
     def handle_append_entries(self, msg):
@@ -345,8 +343,6 @@ class RaftNode:
         # part 2: Check that the previous log entry matches (same index and term) before accepting new entries. If the check fails, respond with `success=False`. If it passes, append the new entries to the log and update `commit_index` if the leader's commit index is higher 
         with self.lock:
             if msg.get('term') < self.current_term:
-                self._step_down(msg['term'])
-                self._random_election_timeout
                 # set the response to false if term is outdated
                 response = {
                     "type": MSG_APPEND_ENTRIES_RESPONSE,
@@ -354,22 +350,6 @@ class RaftNode:
                     "dst": msg['src'],
                     "term": self.current_term,
                     "success": False
-                }
-            else:
-                # # Reset election timeout when valid heartbeat recived
-                self.current_term = msg.get('term')
-                self.role = FOLLOWER
-                self.leader_id = msg['src']
-                self.last_heartbeat_time = time.time() #
-                # Reset election timeout is randomised so that one node times out earlier and becomes a candidite first the next election. 
-                self.election_timeout = self._random_election_timeout()
-
-                response = {
-                    "type": MSG_APPEND_ENTRIES_RESPONSE,
-                    "src": self.node_id,
-                    "dst": msg['src'],
-                    "term": self.current_term,
-                    "success": True
                 }
                 self._send(response)
                 return
@@ -390,7 +370,7 @@ class RaftNode:
             if prev_log_index > 0:
                 # also added check for if follower log is empty
                 local_prev_entry = self._get_log_entry(prev_log_index)
-                if local_prev_entry is None or local_prev_entry != prev_log_term:
+                if local_prev_entry is None or local_prev_entry["term"] != prev_log_term:
                     # Previous log entry does not match, reject the AppendEntries
                     response = {
                         "type": MSG_APPEND_ENTRIES_RESPONSE,
@@ -411,7 +391,7 @@ class RaftNode:
                         
                 if self._get_log_entry(entry['index']) is None:
                     self.log.append(entry)
-                    self.save_state
+                    self.save_state()
 
             # Update commit index if leader's commit index is higher
             if leader_commit > self.commit_index:
@@ -425,7 +405,7 @@ class RaftNode:
                 "dst": msg['src'],
                 "term": self.current_term,
                 "success": True,
-                "match_index":self._get_last_log_index()
+                "match_index": self._get_last_log_index()
             }
         self._send(response)
 
@@ -438,17 +418,20 @@ class RaftNode:
 
         if self.role != LEADER:
             return
-        
+        follower_id = msg['src']
         # added a bit of backtracking to handle failed append. simple not fully implemeted
         if not msg.get('success', False):
-            self.next_index[msg['src']] = max(1, self.next_index.get(msg['src'], 1) - 1)
+            self.next_index[follower_id] = max(1, self.next_index.get(follower_id, 1) - 1)
             return
         
         #sucessful then followers match up to the index
-        follower_match_index = msg.get('match_index', self._get_last_log_index())
-        self.match_index[msg['src']] = follower_match_index
-        self.next_index[msg['src']] = follower_match_index + 1
+        follower_match_index = msg.get('match_index', 0)
+        self.match_index[follower_id] = follower_match_index
+        self.next_index[follower_id] = follower_match_index + 1
+
         # Check if there are any new entries that can be committed
+        majority = (len(NODE_IDS) // 2) + 1
+
         for index in range(self.commit_index + 1, self._get_last_log_index() + 1):
             entry = self._get_log_entry(index)
             if entry is None:
@@ -465,7 +448,7 @@ class RaftNode:
                 if self.match_index.get(peer_id, 0) >= index:
                     count += 1
 
-            if count >= (len(NODE_IDS) // 2)+1:
+            if count >= majority:
                 self.commit_index = index
         self.apply_committed()
 
@@ -473,27 +456,44 @@ class RaftNode:
 
     def handle_client_request(self, msg):
         # TODO: Implement client request handling
-        # For now, operations do not go through the Raft log, it will be done in part 3 (following the brief)
-        # For now, just respond to the client for debugging purposes 
-        # part 2:
-        # PUT/DELETE: append the operation to the Raft log as a new entry instead of writing directly to kv_store. 
-        # The entry will be applied later when it is committed. GET can still read directly from kv_store for now (linearisable reads are added in Part 4)
-        # should handle multiple keys
+        if not hasattr(self, 'client_response_cache'):
+            # can't add req cache in init so putting it here (using it to store the response for each request id)
+            self.client_response_cache = {}
 
-        # should handle overwriting an existing key (and DELETE)(ie if key already exists and client tries to put a new value for that key, should overwrite the value instead of returning an error)   
+        if not hasattr(self, "pending_requests"):
+            self.pending_requests = set()
+
+        request_id = msg.get("request_id")
+        client_id = msg["src"]
+        cache_key = (client_id, request_id)
+        # Duplication handleing, return cached respnce if seen before
+        if cache_key  in self.client_response_cache:
+            self._send(self.client_response_cache[cache_key])
+            return
+        # If current request is already in the log but not committed yet, do not append it again
+        if cache_key in self.pending_requests:
+            return
         # got rid of the check for if not leader, as the brief said to ignore that for part 2 and just respond to the client for debugging purposes. The response is still sent through the network router, but it will be sent even if this node is not the leader.
-        #if self.role != LEADER:
-            # Redirect client to the current leader if not the leader
-            # response = make_client_response(
-                #self.node_id,
-                #msg['src'],  
-                #request_id=msg.get("request_id"),
-                #success=False,
-                #error="Not the leader",
-                #leader_hint=self.leader_id
-            #)
-            #self._send(response)
-            # return
+        # if not the leader forward to a known leader        
+        if self.role != LEADER:
+            if self.leader_id is not None:
+                forward_msg = dict(msg)  
+                forward_msg['dst'] = self.leader_id
+                self._send(forward_msg)
+                return
+            
+            response = make_client_response(
+                self.node_id,
+                msg['src'],  
+                request_id=msg.get("request_id"),
+                success=False,
+                error="Not the leader",
+                leader_hint=self.leader_id
+            )
+            #adding responce to cache before sending 
+            self.client_response_cache[request_id] = response
+            self._send(response)
+            return
         
         # do a get and put operation on the kv store for debugging purposes
         operation = msg.get('operation', '').upper()
@@ -512,12 +512,10 @@ class RaftNode:
                 "client_id": msg['src'],
                 "request_id": msg.get("request_id")
             }
+            self.pending_requests.add(cache_key)
             self.log.append(entry)
-            self.save_state
-            self.commit_index = entry["index"]
-            self.apply_committed()
-            if self.role == LEADER:
-                self.send_heartbeats()
+            self.save_state()
+            self.send_heartbeats()
             return
             """
             response = make_client_response(
@@ -548,7 +546,10 @@ class RaftNode:
                     success=False,
                     error=f"Key '{key}' not found"
                 )
-                print("RESPONSE:", response)
+            print("RESPONSE:", response)
+            self.client_response_cache[cache_key] = response
+            self._send(response)
+            return
 
         elif operation == "DELETE":
             # also changed this to read from the log 
@@ -564,12 +565,10 @@ class RaftNode:
                     "client_id": msg['src'],
                     "request_id": msg.get("request_id")
                 }
+                self.pending_requests.add(cache_key)
                 self.log.append(entry)
-                self.save_state
-                self.commit_index = entry["index"]
-                self.apply_committed()
-                if self.role == LEADER:
-                    self.send_heartbeats()
+                self.save_state()
+                self.send_heartbeats()
                 return
 
                 """
@@ -585,14 +584,14 @@ class RaftNode:
                 print("RESPONSE:", response)
                 """
 
-        else :
-            response = make_client_response(
-                self.node_id,
-                msg['src'],
-                request_id=msg.get("request_id"),
-                success=False,
-                error=f"Unknown operation: {msg.get('operation')}"
-            )
+        response = make_client_response(
+            self.node_id,
+            msg['src'],
+            request_id=msg.get("request_id"),
+            success=False,
+            error=f"Unknown operation: {msg.get('operation')}"
+        )
+        self.client_response_cache[request_id] = response
         print(f"[{self.node_id}] SENDING RESPONSE:", response)
         self._send(response)
 
@@ -601,7 +600,12 @@ class RaftNode:
 
     def apply_committed(self):
         # TODO: Implement state machine application
-        
+        if not hasattr(self, "client_response_cache"):
+            self.client_response_cache = {}
+
+        if not hasattr(self, "pending_requests"):
+            self.pending_requests = set()
+
         # Loop through last applied and commit index
         while self.last_applied < self.commit_index:
         #for i in range(self.last_applied + 1, self.commit_index + 1):
@@ -610,7 +614,6 @@ class RaftNode:
             if entry is None:
                 # This should not happen, but just in case
                 print(f"[{self.node_id}] No log entry found at index {self.last_applied}")
-                self.last_applied = self.commit_index  
                 #skip
                 continue
 
@@ -642,21 +645,26 @@ class RaftNode:
                 success = False
                 error = f"Unknown operation: {operation}"
                 responce_value = None
-            
+
+            request_id = entry.get("request_id")
+            client_id = entry.get("client_id")
             # If leader, send response using this entry's metadata
-            if entry.get("client_id") is not None:
+            if client_id is not None and request_id is not None:
                 response = make_client_response(
                     self.node_id,
                     # Use the ID form the log entry 
-                    entry['client_id'],
-                    request_id = entry['request_id'],
+                    client_id,
+                    request_id = request_id,
                     success = success,
                     value = responce_value,
                     error = error
                 )
+                cache_key = (client_id, request_id)
+                self.client_response_cache[cache_key] = response
+                self.pending_requests.discard(cache_key)
                 self._send(response)
         # To update the pointer  
-        self.last_applied = self.commit_index
+        # self.last_applied = self.commit_index
 
     # CHECKPOINTING / SNAPSHOTTING (Part 3)
 
@@ -680,6 +688,8 @@ class RaftNode:
             "log": self.log,
             "snapshot": None
         }
+
+        os.makedirs(DATA_DIR, exist_ok=True)
 
         # Define paths
         final_path = f"data/{self.node_id}.json"
