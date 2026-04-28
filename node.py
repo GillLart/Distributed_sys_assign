@@ -433,7 +433,7 @@ class RaftNode:
         # TODO: Implement AppendEntries response handling
         if msg['term'] > self.current_term:
             self._step_down(msg['term'])
-            self._random_election_timeout
+            self.election_timeout= self._random_election_timeout()
             return
 
         if self.role != LEADER:
