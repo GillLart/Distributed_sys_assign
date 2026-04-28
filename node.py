@@ -236,6 +236,7 @@ class RaftNode:
             # Grant the vote
             vote_granted = True
             self.voted_for = msg['src']
+            self.save_state
             print(f"[{self.node_id}] Voting FOR {msg['src']} in term {self.current_term} ")
         
             # Success response
@@ -346,7 +347,7 @@ class RaftNode:
             if msg.get('term') < self.current_term:
                 self._step_down(msg['term'])
                 self._random_election_timeout
-                # set the responce to false if term is outdated
+                # set the response to false if term is outdated
                 response = {
                     "type": MSG_APPEND_ENTRIES_RESPONSE,
                     "src": self.node_id,    
@@ -387,7 +388,7 @@ class RaftNode:
 
             # check previous log entry matches
             if prev_log_index > 0:
-                # also addched check for if follower log is empty
+                # also added check for if follower log is empty
                 local_prev_entry = self._get_log_entry(prev_log_index)
                 if local_prev_entry is None or local_prev_entry != prev_log_term:
                     # Previous log entry does not match, reject the AppendEntries
@@ -410,6 +411,7 @@ class RaftNode:
                         
                 if self._get_log_entry(entry['index']) is None:
                     self.log.append(entry)
+                    self.save_state
 
             # Update commit index if leader's commit index is higher
             if leader_commit > self.commit_index:
@@ -511,6 +513,7 @@ class RaftNode:
                 "request_id": msg.get("request_id")
             }
             self.log.append(entry)
+            self.save_state
             self.commit_index = entry["index"]
             self.apply_committed()
             if self.role == LEADER:
@@ -562,6 +565,7 @@ class RaftNode:
                     "request_id": msg.get("request_id")
                 }
                 self.log.append(entry)
+                self.save_state
                 self.commit_index = entry["index"]
                 self.apply_committed()
                 if self.role == LEADER:
@@ -741,7 +745,7 @@ class RaftNode:
         self.role = FOLLOWER
         self.voted_for = None
         self.leader_id = None
-        self.save_state()
+        self.save_state
 
 # ENTRY POINT
 
