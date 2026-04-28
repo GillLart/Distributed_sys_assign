@@ -215,10 +215,9 @@ class RaftNode:
     def handle_request_vote(self, msg):
         #thie is the version that doesn't cause a error
         if msg['term'] > self.current_term:
-            self.current_term = msg['term']
-            self.role = FOLLOWER
+            self._step_down(msg['term'])
+            self._random_election_timeout
             vote_granted = False # Reject vote
-            self.voted_for = None # Reset vote for the new term
 
             my_last_term = self._get_last_log_term()
             my_last_index = self._get_last_log_index()
@@ -262,10 +261,8 @@ class RaftNode:
 
     def handle_request_vote_response(self, msg):
         if msg['term'] > self.current_term:
-            self.current_term = msg['term']
-            self.role = FOLLOWER
-            self.voted_for = None
-            self.leader_id = None
+            self._step_down(msg['term'])
+            self._random_election_timeout
             return
         # To care about the votes, make sure are candiate
         if self.role != CANDIDATE:
@@ -314,8 +311,8 @@ class RaftNode:
                 elif first_entry > len(self.log):
                     entries_to_send = []
                 else:    
-                    # -1 so that the raft index iis converted to python index (bacuse raft atarts at 1 and py at 0)
-                    entries_to_send = self.log[first_entry-1:]
+                    # -1 so that the raft index is converted to python index (bacuse raft atarts at 1 and py at 0)
+                    entries_to_send = self._get_log_slice
                 
                 # Determine the previous point
                 prev_log_index = self.next_index[peer_id] - 1
@@ -347,6 +344,8 @@ class RaftNode:
         # part 2: Check that the previous log entry matches (same index and term) before accepting new entries. If the check fails, respond with `success=False`. If it passes, append the new entries to the log and update `commit_index` if the leader's commit index is higher 
         with self.lock:
             if msg.get('term') < self.current_term:
+                self._step_down(msg['term'])
+                self._random_election_timeout
                 # set the responce to false if term is outdated
                 response = {
                     "type": MSG_APPEND_ENTRIES_RESPONSE,
@@ -371,25 +370,102 @@ class RaftNode:
                     "term": self.current_term,
                     "success": True
                 }
+                self._send(response)
+                return
+            # # Reset election timeout when valid heartbeat recived
+            self.current_term = msg.get('term')
+            self.role = FOLLOWER
+            self.leader_id = msg['src']
+            self.last_heartbeat_time = time.time() #
+            # Reset election timeoutis randomised so that one node times out earlier and becomes a candidite first the next election. 
+            self.election_timeout = self._random_election_timeout()
+
+            prev_log_index = msg.get('prev_log_index',0)
+            prev_log_term = msg.get('prev_log_term',0)
+            entries = msg.get('entries', [])
+            leader_commit = msg.get('leader_commit', 0)
+
+            # check previous log entry matches
+            if prev_log_index > 0:
+                # also addched check for if follower log is empty
+                local_prev_entry = self._get_log_entry(prev_log_index)
+                if local_prev_entry is None or local_prev_entry != prev_log_term:
+                    # Previous log entry does not match, reject the AppendEntries
+                    response = {
+                        "type": MSG_APPEND_ENTRIES_RESPONSE,
+                        "src": self.node_id,
+                        "dst": msg['src'],
+                        "term": self.current_term,
+                        "success": False,
+                        "match_index": self._get_last_log_index()
+                    }
+                    self._send(response)
+                    return
+            # Append new entries to the log
+            for entry in entries: 
+                existing = self._get_log_entry(entry['index'])
+                if existing is not None and existing['term'] != entry['term']:
+                        # Conflict detected, delete the existing entry and all that follow it
+                        self.log = [e for e in self.log if e['index'] < entry['index']]
+                        
+                if self._get_log_entry(entry['index']) is None:
+                    self.log.append(entry)
+
+            # Update commit index if leader's commit index is higher
+            if leader_commit > self.commit_index:
+                self.commit_index = min(leader_commit, self._get_last_log_index())
+                # Apply any newly committed entries to the state machine
+                self.apply_committed() 
+                
+            response = {
+                "type": MSG_APPEND_ENTRIES_RESPONSE,
+                "src": self.node_id,
+                "dst": msg['src'],
+                "term": self.current_term,
+                "success": True,
+                "match_index":self._get_last_log_index()
+            }
         self._send(response)
 
     def handle_append_entries_response(self, msg):
         # TODO: Implement AppendEntries response handling
-        # part 1 doesnt have anything for this method put the next oats will
-        # part 2: On success, update `match_index` and `next_index` for that follower. 
-        # Then check if any log entry has been replicated to a majority of nodes - if so, 
-        # advance `commit_index` to that entry (only commit entries from the current term).
-        #  For now, you can assume AppendEntries always succeeds on the perfect network (handling `success=False` with log backtracking is added in Part 3)
-
         if msg['term'] > self.current_term:
-            self.role = FOLLOWER
+            self._step_down(msg['term'])
+            self._random_election_timeout
+            return
 
         if self.role != LEADER:
             return
         
-        self.next_index[msg['src']] -= 1 # Incase the follower says 'no' to entries, then its behind so try for one of that nodes previous entries next time
+        # added a bit of backtracking to handle failed append. simple not fully implemeted
+        if not msg.get('success', False):
+            self.next_index[msg['src']] = max(1, self.next_index.get(msg['src'], 1) - 1)
+            return
+        
+        #sucessful then followers match up to the index
+        follower_match_index = msg.get('match_index', self._get_last_log_index())
+        self.match_index[msg['src']] = follower_match_index
+        self.next_index[msg['src']] = follower_match_index + 1
+        # Check if there are any new entries that can be committed
+        for index in range(self.commit_index + 1, self._get_last_log_index() + 1):
+            entry = self._get_log_entry(index)
+            if entry is None:
+                continue
+            #only commit entries from current term
+            if entry['term'] != self.current_term:
+                continue
+            # this should be the leader's own log, so it counts as a match
+            count = 1  
 
-        pass
+            for peer_id in NODE_IDS:
+                if peer_id == self.node_id:
+                    continue
+                if self.match_index.get(peer_id, 0) >= index:
+                    count += 1
+
+            if count >= (len(NODE_IDS) // 2)+1:
+                self.commit_index = index
+        self.apply_committed()
 
     # CLIENT REQUEST HANDLING
 
@@ -422,7 +498,25 @@ class RaftNode:
         key = msg.get('key')  
         if  operation == "PUT":
             value = msg.get('value')
-            self.kv_store[key] = value
+            # changed self.kv_store[key] = value to append to the log
+            entry = {
+                "index": self._get_last_log_index() + 1,
+                "term": self.current_term,
+                "command":{
+                    "operation": operation,
+                    "key": key,
+                    "value": value
+                },
+                "client_id": msg['src'],
+                "request_id": msg.get("request_id")
+            }
+            self.log.append(entry)
+            self.commit_index = entry["index"]
+            self.apply_committed()
+            if self.role == LEADER:
+                self.send_heartbeats()
+            return
+            """
             response = make_client_response(
                 self.node_id,
                 msg['src'],
@@ -430,6 +524,8 @@ class RaftNode:
                 success = True,
                 value = value
             )
+
+            """
         elif operation == "GET":
             if key in self.kv_store:
                 value = self.kv_store[key]
@@ -441,7 +537,6 @@ class RaftNode:
                     value=self.kv_store[key]
                 )
                 print("RESPONSE:", response)
-                self._send(response)
             else:
                 response = make_client_response(
                     self.node_id,
@@ -451,20 +546,40 @@ class RaftNode:
                     error=f"Key '{key}' not found"
                 )
                 print("RESPONSE:", response)
-                self._send(response)
 
         elif operation == "DELETE":
-            if key in self.kv_store:
-                del self.kv_store[key]
+            # also changed this to read from the log 
+                #del self.kv_store[key]
+                entry = {
+                    "index": self._get_last_log_index() + 1,
+                    "term": self.current_term,
+                    "command":{
+                        "operation": "DELETE",
+                        "key": key,
+                        "value": None
+                    },
+                    "client_id": msg['src'],
+                    "request_id": msg.get("request_id")
+                }
+                self.log.append(entry)
+                self.commit_index = entry["index"]
+                self.apply_committed()
+                if self.role == LEADER:
+                    self.send_heartbeats()
+                return
+
+                """
                 response = make_client_response(
                     self.node_id,
                     msg['src'],
                     request_id=msg.get("request_id"),
                     success=True,
-                    value=None
+                    value=None,
+                    client_id=msg['src'],
+                    request_id=msg.get("request_id")
                 )
                 print("RESPONSE:", response)
-                self._send(response)
+                """
 
         else :
             response = make_client_response(
@@ -484,29 +599,56 @@ class RaftNode:
         # TODO: Implement state machine application
         
         # Loop through last applied and commit index
-        for i in range(self.last_applied + 1, self.commit_index + 1):
-            entry = self.log[i]
-            cmd = entry['command']
+        while self.last_applied < self.commit_index:
+        #for i in range(self.last_applied + 1, self.commit_index + 1):
+            self.last_applied += 1
+            entry = self._get_log_entry(self.last_applied)
+            if entry is None:
+                # This should not happen, but just in case
+                print(f"[{self.node_id}] No log entry found at index {self.last_applied}")
+                self.last_applied = self.commit_index  
+                #skip
+                continue
 
+            cmd = entry.get('command', {})
             # Pull the data from this specific log entry
             operation = cmd.get('operation', '').upper()
             key = cmd.get('key')
             value = cmd.get('value')
 
             # Apply this entry's data to the key store
+            # handling for put/ overwrites
             if operation == "PUT":
                 self.kv_store[key] = value
+                success = True
+                error = None
+                responce_value = value
+
+            # handleing for deletes (if the key exists)
             elif operation == "DELETE":
+                #check if the key exists before trying to delete it
+                existed = key in self.kv_store
                 self.kv_store.pop(key, None)
+                success = existed
+                error = None if existed else f"Key '{key}' not found"
+                responce_value = None   
+
+            # handleing for unknown operations
+            else:
+                success = False
+                error = f"Unknown operation: {operation}"
+                responce_value = None
             
             # If leader, send response using this entry's metadata
-            if self.role == "LEADER":
+            if entry.get("client_id") is not None:
                 response = make_client_response(
                     self.node_id,
-                    entry['client_id'], # Use the ID form the log entry
+                    # Use the ID form the log entry 
+                    entry['client_id'],
                     request_id = entry['request_id'],
-                    success = True,
-                    value = self.kv_store(key) # Safely get the value
+                    success = success,
+                    value = responce_value,
+                    error = error
                 )
                 self._send(response)
         # To update the pointer  
