@@ -670,11 +670,42 @@ class RaftNode:
 
     def take_snapshot(self):
         # TODO (Part 3): Implement snapshotting
-        pass
+        #if nothing to snapshot then return
+        if self.last_applied == 0:
+            return
+        
+        last_included_index = self.last_applied
+        last_included_term = self._get_log_term(last_included_index)
+
+        snap = {
+            "kv_store": self.kv_store.copy(),
+            "last_included_index": last_included_index,
+            #to preserve log consistency after old log entries are deleted
+            "last_included_term": last_included_term
+        }
+        #keep just the logs after the snapshot 
+        self.log = [
+            entry for entry in self.log if entry['index'] > last_included_index
+            ]
+        
+        self.snapshot=snap
+        self.save_state()
+        
 
     def load_snapshot(self, snapshot_data):
         # TODO (Part 3): Implement snapshot loading
-        pass
+        # is theres no snapshot data then return
+        if snapshot_data is None:
+            return
+
+        # Update the key-value store
+        self.kv_store = snapshot_data.get("kv_store", {}).copy()
+        last_included_index = snapshot_data.get("last_included_index", 0)
+
+        self.last_applied = last_included_index
+        self.current_term = last_included_index
+
+        self.snapshot = snapshot_data
 
     # STATE PERSISTENCE (Part 3)
 
@@ -686,7 +717,7 @@ class RaftNode:
             "current_term": self.current_term,
             "voted_for": self.voted_for,
             "log": self.log,
-            "snapshot": None
+            "snapshot": getattr(self, "snapshot", None)
         }
 
         os.makedirs(DATA_DIR, exist_ok=True)
@@ -720,7 +751,10 @@ class RaftNode:
         self.current_term = data.get('current_term', 0)
         self.voted_for = data.get('voted_for')
         self.log = data.get('log', [])
+        self.snapshot = data.get('snapshot', None)
 
+        if self.snapshot is not None:
+            self.load_snapshot(self.snapshot)
     # HELPER METHODS 
 
     def _get_last_log_index(self):
