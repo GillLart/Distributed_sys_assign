@@ -352,8 +352,23 @@ class RaftNode:
                     "src": self.node_id,    
                     "dst": msg['src'],
                     "term": self.current_term,
-                    "success": False,
-                    "match_index": self._get_last_log_index()
+                    "success": False
+                }
+            else:
+                # # Reset election timeout when valid heartbeat recived
+                self.current_term = msg.get('term')
+                self.role = FOLLOWER
+                self.leader_id = msg['src']
+                self.last_heartbeat_time = time.time() #
+                # Reset election timeout is randomised so that one node times out earlier and becomes a candidite first the next election. 
+                self.election_timeout = self._random_election_timeout()
+
+                response = {
+                    "type": MSG_APPEND_ENTRIES_RESPONSE,
+                    "src": self.node_id,
+                    "dst": msg['src'],
+                    "term": self.current_term,
+                    "success": True
                 }
                 self._send(response)
                 return
@@ -462,12 +477,12 @@ class RaftNode:
         # PUT/DELETE: append the operation to the Raft log as a new entry instead of writing directly to kv_store. 
         # The entry will be applied later when it is committed. GET can still read directly from kv_store for now (linearisable reads are added in Part 4)
         # should handle multiple keys
-       
+
         # should handle overwriting an existing key (and DELETE)(ie if key already exists and client tries to put a new value for that key, should overwrite the value instead of returning an error)   
         # got rid of the check for if not leader, as the brief said to ignore that for part 2 and just respond to the client for debugging purposes. The response is still sent through the network router, but it will be sent even if this node is not the leader.
         #if self.role != LEADER:
             # Redirect client to the current leader if not the leader
-           # response = make_client_response(
+            # response = make_client_response(
                 #self.node_id,
                 #msg['src'],  
                 #request_id=msg.get("request_id"),
@@ -653,11 +668,44 @@ class RaftNode:
 
     def save_state(self):
         # TODO (Part 3): Implement state persistence
-        pass
+
+        # Build the dictionary
+        state = {
+            "current_term": self.current_term,
+            "voted_for": self.voted_for,
+            "log": self.log,
+            "snapshot": None
+        }
+
+        # Define paths
+        final_path = f"data/{self.node_id}.json"
+        temp_path = final_path + ".tmp"
+
+        # Write to temp file
+        with open(temp_path, 'w') as f:
+            json.dump(state, f)
+
+        # To instantly swap between both files
+        os.replace(temp_path, final_path)
 
     def load_state(self):
         # TODO (Part 3): Implement state loading
-        pass
+
+        # Build the file path
+        file_path = f"data/{self.node_id}.json"
+        
+        # Check if the file exists
+        if os.path.exists(file_path):
+            # Open and read the file
+            with open(file_path, 'r') as f:
+                data = json.load(f) # Turn text into a python dictionary
+        else:
+            return # Return nothing if file does not exist
+
+        # Update the variables
+        self.current_term = data.get('current_term', 0)
+        self.voted_for = data.get('voted_for')
+        self.log = data.get('log', [])
 
     # HELPER METHODS 
 
@@ -693,6 +741,7 @@ class RaftNode:
         self.role = FOLLOWER
         self.voted_for = None
         self.leader_id = None
+        self.save_state()
 
 # ENTRY POINT
 
