@@ -189,6 +189,7 @@ class RaftNode:
         self.current_term += 1
         self.role = CANDIDATE
         self.voted_for = self.node_id
+        self.save_state()
         self.votes_received = {self.node_id}  # Vote for self
         self.leader_id = None
 
@@ -237,6 +238,8 @@ class RaftNode:
             # Grant the vote
             self.voted_for = msg['src']
             self.save_state()
+            self.last_heartbeat_time = time.time()
+            self.election_timeout = self._random_election_timeout()
             print(f"[{self.node_id}] Voting FOR {msg['src']} in term {self.current_term} ")
         
             # Success response
@@ -703,7 +706,7 @@ class RaftNode:
         last_included_index = snapshot_data.get("last_included_index", 0)
 
         self.last_applied = last_included_index
-        self.current_term = last_included_index
+        self.commit_index = last_included_index
 
         self.snapshot = snapshot_data
 
@@ -790,6 +793,9 @@ class RaftNode:
         self.voted_for = None
         self.leader_id = None
         self.save_state
+
+    # Extention bit
+
 
 # ENTRY POINT
 
