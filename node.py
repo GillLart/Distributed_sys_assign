@@ -408,7 +408,7 @@ class RaftNode:
                 "dst": msg['src'],
                 "term": self.current_term,
                 "success": True,
-                "match_index": self._get_last_log_index()
+                "match_index": prev_log_index + len(entries)
             }
         self._send(response)
 
@@ -417,6 +417,9 @@ class RaftNode:
         if msg['term'] > self.current_term:
             self._step_down(msg['term'])
             self.election_timeout= self._random_election_timeout()
+            return
+        
+        if msg['term'] < self.current_term:
             return
 
         if self.role != LEADER:
@@ -428,7 +431,7 @@ class RaftNode:
             return
         
         #sucessful then followers match up to the index
-        follower_match_index = msg.get('match_index', 0)
+        follower_match_index = min(msg.get('match_index', 0), self._get_last_log_index())
         self.match_index[follower_id] = follower_match_index
         self.next_index[follower_id] = follower_match_index + 1
 
@@ -494,7 +497,7 @@ class RaftNode:
                 leader_hint=self.leader_id
             )
             #adding responce to cache before sending 
-            self.client_response_cache[request_id] = response
+            self.client_response_cache[cache_key] = response
             self._send(response)
             return
         
@@ -594,7 +597,7 @@ class RaftNode:
             success=False,
             error=f"Unknown operation: {msg.get('operation')}"
         )
-        self.client_response_cache[request_id] = response
+        self.client_response_cache[cache_key] = response
         print(f"[{self.node_id}] SENDING RESPONSE:", response)
         self._send(response)
 
