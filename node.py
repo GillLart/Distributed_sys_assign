@@ -191,7 +191,7 @@ class RaftNode:
         self.voted_for = self.node_id
         self.save_state()
         self.votes_received = {self.node_id}  # Vote for self
-        self.leader_id = None
+        #self.leader_id = None
 
         print(f"[{self.node_id}] Starting election for term {self.current_term}")
 
@@ -217,7 +217,6 @@ class RaftNode:
         #thie is the version that doesn't cause a error
         if msg['term'] > self.current_term:
             self._step_down(msg['term'])
-            self.election_timeout = self._random_election_timeout()
             #vote_granted = False # Reject vote
 
         my_last_term = self._get_last_log_term()
@@ -266,7 +265,6 @@ class RaftNode:
     def handle_request_vote_response(self, msg):
         if msg['term'] > self.current_term:
             self._step_down(msg['term'])
-            self.election_timeout = self._random_election_timeout() 
             return
         # To care about the votes, make sure are candiate
         if self.role != CANDIDATE:
@@ -305,25 +303,25 @@ class RaftNode:
 
     def send_heartbeats(self):
         # TODO: Implement heartbeats / log replication
-
+        #print(f"Active threads: {threading.active_count()}")
+        if self.role != LEADER:
+            return
+            
         for peer_id in NODE_IDS:
             if peer_id == self.node_id:
                 # Don't send heartbeats to self
                 continue
             # Determine what to send
             next_index = self.next_index.get(peer_id, 1)
-            # get the log entries from the next index onward (if any)
-            entries_to_send = self.log[next_index-1:]
+            # get the log entries from the next index onward (if any)(using index filtering)
+            entries_to_send = [e for e in self.log 
+                               if e["index"]>=next_index]
             
             # Determine the previous point
             prev_log_index = next_index - 1
 
             #  previoud log term
-            if prev_log_index > 0:
-                prev_log_term = self._get_log_term(prev_log_index)
-            else:  
-                # At the very beginning of the log
-                prev_log_term = 0
+            prev_log_term = self._get_log_term(prev_log_index) if prev_log_index > 0 else 0
 
             msg = {
             "type": MSG_APPEND_ENTRIES,
@@ -338,7 +336,54 @@ class RaftNode:
             }
             
             self._send(msg)
+
         
+        # Inline cleanup of stale pending reads
+        if hasattr(self, '_pending_reads') and self._pending_reads:
+            still_pending = []
+            for read in self._pending_reads:
+                if time.time() - read.get('created_at', 0) > 4.0:
+                    self._send(make_client_response(
+                        self.node_id, read['client_id'],
+                        request_id=read['request_id'],
+                        success=False, error="read timeout, please retry"
+                    ))
+                else:
+                    still_pending.append(read)
+            self._pending_reads = still_pending
+
+        # Inline cleanup of stale pending writes
+        if not hasattr(self, '_pending_write_times'):
+            self._pending_write_times = {}
+        now = time.time()
+        for cache_key in list(getattr(self, 'pending_requests', set())):
+            if cache_key not in self._pending_write_times:
+                self._pending_write_times[cache_key] = now
+            elif now - self._pending_write_times[cache_key] > 4.0:
+                client_id, request_id = cache_key
+                # Only remove from log if not yet committed
+                self.log = [e for e in self.log
+                            if not (e.get('client_id') == client_id and
+                                    e.get('request_id') == request_id and
+                                    e.get('index', 0) > self.commit_index)]
+                #this seems to be triggered when testing sequential operations on a partitioned network
+                self._send(make_client_response(
+                    self.node_id, client_id,
+                    request_id=request_id,
+                    success=False, error="write timeout, please retry"
+                ))
+                self.pending_requests.discard(cache_key)
+                self._pending_write_times.pop(cache_key, None)
+        # Continuous leader heartbeat loop only sends if one isn't already sceduled
+        if self.role == LEADER and not getattr(self, '_hb_scheduled', False):
+            self._hb_scheduled = True
+            def _next():
+                if self.role == LEADER:
+                    self._hb_scheduled = False  # reset AFTER the role check
+                    self.send_heartbeats()
+                else:
+                    self._hb_scheduled = False
+            threading.Timer(0.5, _next).start()
 
     def handle_append_entries(self, msg):
         # TODO: Implement AppendEntries handling
@@ -357,8 +402,10 @@ class RaftNode:
                 self._send(response)
                 return
             # # Reset election timeout when valid heartbeat recived
-            self.current_term = msg.get('term')
-            self.role = FOLLOWER
+            if msg.get('term') > self.current_term:
+                self._step_down(msg.get('term'), reset_timer=True)
+            else:
+                self.role = FOLLOWER
             self.leader_id = msg['src']
             self.last_heartbeat_time = time.time() #
             # Reset election timeoutis randomised so that one node times out earlier and becomes a candidite first the next election. 
@@ -391,6 +438,7 @@ class RaftNode:
                 if existing is not None and existing['term'] != entry['term']:
                         # Conflict detected, delete the existing entry and all that follow it
                         self.log = [e for e in self.log if e['index'] < entry['index']]
+                        self.save_state()
                         
                 if self._get_log_entry(entry['index']) is None:
                     self.log.append(entry)
@@ -401,6 +449,35 @@ class RaftNode:
                 self.commit_index = min(leader_commit, self._get_last_log_index())
                 # Apply any newly committed entries to the state machine
                 self.apply_committed() 
+
+            # Drain any pending reads now that there is a valid heartbeat
+            if hasattr(self, '_pending_reads') and self._pending_reads:
+                still_pending = []
+                for read in self._pending_reads:
+                    if time.time() - read.get('created_at', 0) > 4.0:
+                        self._send(make_client_response(
+                            self.node_id, read['client_id'],
+                            request_id=read['request_id'],
+                            success=False, error="read timeout, please retry"
+                        ))
+                    else:
+                        key = read['key']
+                        if key in self.kv_store:
+                            response = make_client_response(
+                                self.node_id, read['client_id'],
+                                request_id=read['request_id'],
+                                success=True, value=self.kv_store[key]
+                            )
+                        else:
+                            response = make_client_response(
+                                self.node_id, read['client_id'],
+                                request_id=read['request_id'],
+                                success=False,
+                                error=f"Key '{read['key']}' not found"
+                            )
+                        self.client_response_cache[read['cache_key']] = response
+                        self._send(response)
+                self._pending_reads = []
                 
             response = {
                 "type": MSG_APPEND_ENTRIES_RESPONSE,
@@ -416,7 +493,6 @@ class RaftNode:
         # TODO: Implement AppendEntries response handling
         if msg['term'] > self.current_term:
             self._step_down(msg['term'])
-            self.election_timeout= self._random_election_timeout()
             return
         
         if msg['term'] < self.current_term:
@@ -427,16 +503,23 @@ class RaftNode:
         follower_id = msg['src']
         # added a bit of backtracking to handle failed append. simple not fully implemeted
         if not msg.get('success', False):
-            self.next_index[follower_id] = max(1, self.next_index.get(follower_id, 1) - 1)
+            self.next_index[follower_id] = max(1, self.next_index.get(follower_id, self._get_last_log_index() + 1) - 1)
+            #self.send_heartbeats()
             return
         
         #sucessful then followers match up to the index
         follower_match_index = min(msg.get('match_index', 0), self._get_last_log_index())
-        self.match_index[follower_id] = follower_match_index
-        self.next_index[follower_id] = follower_match_index + 1
+        old_match = self.match_index.get(follower_id,0)
+
+        # checking that index isn't going backwards
+        if follower_match_index >old_match:
+            self.match_index[follower_id] = follower_match_index
+            self.next_index[follower_id] = follower_match_index + 1
 
         # Check if there are any new entries that can be committed
         majority = (len(NODE_IDS) // 2) + 1
+
+        old_commit = self.commit_index
 
         for index in range(self.commit_index + 1, self._get_last_log_index() + 1):
             entry = self._get_log_entry(index)
@@ -454,20 +537,71 @@ class RaftNode:
                 if self.match_index.get(peer_id, 0) >= index:
                     count += 1
 
-            if count >= majority:
+            if count >= majority and index > self.commit_index:
                 self.commit_index = index
         self.apply_committed()
 
+        # Serve any pending linearisable reads that have majority confirmation
+        if hasattr(self, '_pending_reads') and self._pending_reads:
+            majority = (len(NODE_IDS) // 2) + 1
+            still_pending = []
+
+            for read in self._pending_reads:
+                # Expire reads older than 5 seconds, respond with failure so client retries fast
+                if time.time() - read.get('created_at', 0) > 4.0:
+                    response = make_client_response(
+                        self.node_id,
+                        read['client_id'],
+                        request_id=read['request_id'],
+                        success=False,
+                        error="read timeout, please retry"
+                    )
+                    self._send(response)
+                    continue
+
+                read['acks'].add(follower_id)
+
+                if len(read['acks']) >= majority and self.last_applied >= read['read_index']:
+                    key = read['key']
+                    if key in self.kv_store:
+                        response = make_client_response(
+                            self.node_id,
+                            read['client_id'],
+                            request_id=read['request_id'],
+                            success=True,
+                            value=self.kv_store[key]
+                        )
+                    else:
+                        response = make_client_response(
+                            self.node_id,
+                            read['client_id'],
+                            request_id=read['request_id'],
+                            success=False,
+                            error=f"Key '{key}' not found"
+                        )
+                    self.client_response_cache[read['cache_key']] = response
+                    self.pending_requests.discard(read['cache_key'])
+                    self._send(response)
+                else:
+                    still_pending.append(read)
+
+            self._pending_reads = still_pending
+        """
+        if self.commit_index > old_commit:
+            for _ in range(3):
+                threading.Timer(0.05 * _, lambda: self.role == LEADER and self.send_heartbeats()).start()
+        """
     # CLIENT REQUEST HANDLING
 
     def handle_client_request(self, msg):
         # TODO: Implement client request handling
-        if not hasattr(self, 'client_response_cache'):
-            # can't add req cache in init so putting it here (using it to store the response for each request id)
-            self.client_response_cache = {}
+        with self.lock:
+            if not hasattr(self, 'client_response_cache'):
+                # can't add req cache in init so putting it here (using it to store the response for each request id)
+                self.client_response_cache = {}
 
-        if not hasattr(self, "pending_requests"):
-            self.pending_requests = set()
+            if not hasattr(self, "pending_requests"):
+                self.pending_requests = set()
 
         request_id = msg.get("request_id")
         client_id = msg["src"]
@@ -478,32 +612,39 @@ class RaftNode:
             return
         # If current request is already in the log but not committed yet, do not append it again
         if cache_key in self.pending_requests:
+            #if self.role ==LEADER:
+                #self.send_heartbeats()
             return
+        
+        operation = msg.get('operation', '').upper()
+        key = msg.get('key')  
+
         # got rid of the check for if not leader, as the brief said to ignore that for part 2 and just respond to the client for debugging purposes. The response is still sent through the network router, but it will be sent even if this node is not the leader.
         # if not the leader forward to a known leader        
         if self.role != LEADER:
+            hops = msg.get("forward_hops", 0)
+            # if message has already been forwarded a couple times, dont do again, could cause a never enging series of forwards
+            if hops >= 8:
+                return
+            
             if self.leader_id is not None:
                 forward_msg = dict(msg)  
                 forward_msg['dst'] = self.leader_id
+                forward_msg["forward_hops"] = hops+1
                 self._send(forward_msg)
                 return
-            
-            response = make_client_response(
-                self.node_id,
-                msg['src'],  
-                request_id=msg.get("request_id"),
-                success=False,
-                error="Not the leader",
-                leader_hint=self.leader_id
-            )
-            #adding responce to cache before sending 
-            self.client_response_cache[cache_key] = response
-            self._send(response)
+            # if leader isnt known, forward to everyonelse before returning not the leader
+            for peer_id in NODE_IDS:
+                if peer_id == self.node_id:
+                    continue
+                forward_msg = dict(msg)
+                forward_msg["dst"] = peer_id
+                forward_msg["forward_hops"] = hops + 1
+                self._send(forward_msg)
+
             return
         
         # do a get and put operation on the kv store for debugging purposes
-        operation = msg.get('operation', '').upper()
-        key = msg.get('key')  
         if  operation == "PUT":
             value = msg.get('value')
             # changed self.kv_store[key] = value to append to the log
@@ -511,7 +652,7 @@ class RaftNode:
                 "index": self._get_last_log_index() + 1,
                 "term": self.current_term,
                 "command":{
-                    "operation": operation,
+                    "operation": "PUT",
                     "key": key,
                     "value": value
                 },
@@ -521,7 +662,7 @@ class RaftNode:
             self.pending_requests.add(cache_key)
             self.log.append(entry)
             self.save_state()
-            self.send_heartbeats()
+            #self.send_heartbeats()
             return
             """
             response = make_client_response(
@@ -533,28 +674,26 @@ class RaftNode:
             )
 
             """
+        # now treating get as a log entry, not served immediately, and is appended to log(only respond after its committed)
         elif operation == "GET":
-            if key in self.kv_store:
-                value = self.kv_store[key]
-                response = make_client_response(
-                    self.node_id,
-                    msg['src'],
-                    request_id=msg.get("request_id"),
-                    success=True,
-                    value=self.kv_store[key]
-                )
-                print("RESPONSE:", response)
-            else:
-                response = make_client_response(
-                    self.node_id,
-                    msg['src'],
-                    request_id=msg.get("request_id"),
-                    success=False,
-                    error=f"Key '{key}' not found"
-                )
-            print("RESPONSE:", response)
-            self.client_response_cache[cache_key] = response
-            self._send(response)
+            # Linearisable read via ReadIndex protocol:
+            # Record the current commit index, send heartbeats, and only
+            # serve the read once a majority has confirmed current node is still leader
+            read_index = self.commit_index
+
+            if not hasattr(self, '_pending_reads'):
+                self._pending_reads = []
+
+            self._pending_reads.append({
+                "read_index": read_index,
+                "key": key,
+                "client_id": msg['src'],
+                "request_id": msg.get("request_id"),
+                "cache_key": cache_key,
+                "acks": {self.node_id},  # leader counts itself
+                "created_at": time.time(), 
+            })
+            #self.send_heartbeats()
             return
 
         elif operation == "DELETE":
@@ -574,7 +713,7 @@ class RaftNode:
                 self.pending_requests.add(cache_key)
                 self.log.append(entry)
                 self.save_state()
-                self.send_heartbeats()
+                #self.send_heartbeats()
                 return
 
                 """
@@ -589,7 +728,7 @@ class RaftNode:
                 )
                 print("RESPONSE:", response)
                 """
-
+        # okay to cache this because it is determanistic
         response = make_client_response(
             self.node_id,
             msg['src'],
@@ -606,12 +745,6 @@ class RaftNode:
 
     def apply_committed(self):
         # TODO: Implement state machine application
-        if not hasattr(self, "client_response_cache"):
-            self.client_response_cache = {}
-
-        if not hasattr(self, "pending_requests"):
-            self.pending_requests = set()
-
         # Loop through last applied and commit index
         while self.last_applied < self.commit_index:
         #for i in range(self.last_applied + 1, self.commit_index + 1):
@@ -628,6 +761,9 @@ class RaftNode:
             operation = cmd.get('operation', '').upper()
             key = cmd.get('key')
             value = cmd.get('value')
+            # ignore snapshot
+            if operation == "SNAPSHOT":
+                continue
 
             # Apply this entry's data to the key store
             # handling for put/ overwrites
@@ -645,6 +781,16 @@ class RaftNode:
                 success = existed
                 error = None if existed else f"Key '{key}' not found"
                 responce_value = None   
+
+            elif operation == "GET":
+                if key in self.kv_store:
+                    success = True
+                    error = None
+                    responce_value = self.kv_store[key]
+                else:
+                    success = False
+                    error = f"key '{key}' not found"
+                    responce_value = None
 
             # handleing for unknown operations
             else:
@@ -669,8 +815,10 @@ class RaftNode:
                 self.client_response_cache[cache_key] = response
                 self.pending_requests.discard(cache_key)
                 self._send(response)
-        # To update the pointer  
-        # self.last_applied = self.commit_index
+        #  pereodiaclly compact the log
+        SNAPSHOT_THRESHOLD = 50
+        if len(self.log) > SNAPSHOT_THRESHOLD:
+            self.take_snapshot()     
 
     # CHECKPOINTING / SNAPSHOTTING (Part 3)
 
@@ -683,18 +831,22 @@ class RaftNode:
         last_included_index = self.last_applied
         last_included_term = self._get_log_term(last_included_index)
 
-        snap = {
+        self.snapshot = {
             "kv_store": self.kv_store.copy(),
             "last_included_index": last_included_index,
             #to preserve log consistency after old log entries are deleted
             "last_included_term": last_included_term
         }
         #keep just the logs after the snapshot 
-        self.log = [
+        self.log = [{
+            "index":last_included_index,
+            "term":last_included_term,
+            "command":{"operation":"SNAPSHOT"}
+        }]+[
             entry for entry in self.log if entry['index'] > last_included_index
             ]
         
-        self.snapshot=snap
+        #self.snapshot=snap
         self.save_state()
         
 
@@ -731,13 +883,12 @@ class RaftNode:
         # Define paths
         final_path = f"data/{self.node_id}.json"
         temp_path = final_path + ".tmp"
-
-        # Write to temp file
-        with open(temp_path, 'w') as f:
-            json.dump(state, f)
-
-        # To instantly swap between both files
-        os.replace(temp_path, final_path)
+        try:
+            with open(temp_path, 'w') as f:
+                json.dump(state, f)
+            os.replace(temp_path, final_path)
+        except OSError as e:
+            print(f"[{self.node_id}] Could not save state: {e}")
 
     def load_state(self):
         # TODO (Part 3): Implement state loading
@@ -746,22 +897,31 @@ class RaftNode:
         file_path = f"data/{self.node_id}.json"
         
         # Check if the file exists
-        if os.path.exists(file_path):
+        if not os.path.exists(file_path):
+            return # Return nothing if file does not exist
+        
+        try:
             # Open and read the file
             with open(file_path, 'r') as f:
                 data = json.load(f) # Turn text into a python dictionary
-        else:
-            return # Return nothing if file does not exist
 
-        # Update the variables
-        self.current_term = data.get('current_term', 0)
-        self.voted_for = data.get('voted_for')
-        self.log = data.get('log', [])
-        self.snapshot = data.get('snapshot', None)
+        except json.JSONDecodeError:
+            print(f"[{self.node_id}] Corrupted state file, deleting it")
+            os.remove(file_path)
+            return
+
+        except OSError as e:
+            print(f"[{self.node_id}] Could not load state: {e}")
+            return
+
+        self.current_term = data.get("current_term", 0)
+        self.voted_for = data.get("voted_for")
+        self.log = data.get("log", [])
+        self.snapshot = data.get("snapshot", None)
 
         if self.snapshot is not None:
             self.load_snapshot(self.snapshot)
-    # HELPER METHODS 
+        # HELPER METHODS 
 
     def _get_last_log_index(self):
         """Return the index of the last log entry, or 0 if log is empty."""
@@ -789,13 +949,25 @@ class RaftNode:
         """Return all log entries from from_index onward (inclusive)."""
         return [e for e in self.log if e["index"] >= from_index]
 
-    def _step_down(self, new_term):
+    def _step_down(self, new_term, reset_timer=False):
         """Revert to follower state with a new term."""
+        if new_term == self.current_term and self.role == FOLLOWER:
+            # Already a follower in this term, nothing to do
+            return
         self.current_term = new_term
         self.role = FOLLOWER
         self.voted_for = None
         self.leader_id = None
-        self.save_state
+        #self.last_heartbeat_time = time.time()
+        if reset_timer:
+            self.last_heartbeat_time = time.time()
+        self.election_timeout = self._random_election_timeout()
+        self._hb_scheduled = False 
+        self._pending_write_times = {}
+        # self._cleanup_scheduled = False
+        # Fail any pending reads so clients retry against the new leader
+        self._pending_reads = []
+        self.save_state()
 
     # Extention bit
 
