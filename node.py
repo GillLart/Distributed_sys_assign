@@ -216,27 +216,29 @@ class RaftNode:
         #thie is the version that doesn't cause a error
         if msg['term'] > self.current_term:
             self._step_down(msg['term'])
-            self._random_election_timeout
-            vote_granted = False # Reject vote
+            #self._random_election_timeout
+            #vote_granted = False # Reject vote
 
-            my_last_term = self._get_last_log_term()
-            my_last_index = self._get_last_log_index()
+        my_last_term = self._get_last_log_term()
+        my_last_index = self._get_last_log_index()
 
-            candidate_last_term = msg['last_log_term']
-            candidate_last_index = msg['last_log_index']
+        candidate_last_term = msg['last_log_term']
+        candidate_last_index = msg['last_log_index']
 
-            # Checking for higher term, then if equal term checking for longer index
-            log_check = (
-            (candidate_last_term > my_last_term) or ((candidate_last_term == my_last_term) and (candidate_last_index >= my_last_index))
-            )
+        # Checking for higher term, then if equal term checking for longer index
+        log_check = (
+        (candidate_last_term > my_last_term) or ((candidate_last_term == my_last_term) and (candidate_last_index >= my_last_index))
+        )
 
         # If had not voted yet or already voted for a specfic candidate 
         if msg['term'] == self.current_term and (self.voted_for is None or self.voted_for == msg['src']) and \
         log_check:
             # Grant the vote
-            vote_granted = True
+            #vote_granted = True
             self.voted_for = msg['src']
-            self.save_state
+            self.save_state()
+            self.last_heartbeat_time = time.time()
+            self.election_timeout = self._random_election_timeout()
             print(f"[{self.node_id}] Voting FOR {msg['src']} in term {self.current_term} ")
         
             # Success response
@@ -244,26 +246,29 @@ class RaftNode:
                 self.node_id,
                 msg['src'],
                 self.current_term,
-                success = vote_granted
+                success =True
             )
+            self._send(response)
         else:
+            msg_age = time.time() - msg.get('timestamp', time.time())
             # Reject the vote
-            print(f"[{self.node_id}] Rejecting vote for {msg['src']} in term {self.current_term}")
+            if msg_age < 2.0:
+                print(f"[{self.node_id}] Rejecting vote for {msg['src']} in term {self.current_term}")
 
-            response = make_request_vote_response (
-                self.node_id,
-                msg['src'],
-                self.current_term,
-                False
-            )
+                response = make_request_vote_response (
+                    self.node_id,
+                    msg['src'],
+                    self.current_term,
+                    False
+                )
 
-        self._send(response)
+                self._send(response)
 
 
     def handle_request_vote_response(self, msg):
         if msg['term'] > self.current_term:
             self._step_down(msg['term'])
-            self._random_election_timeout
+            #self._random_election_timeout
             return
         # To care about the votes, make sure are candiate
         if self.role != CANDIDATE:
@@ -346,7 +351,7 @@ class RaftNode:
         with self.lock:
             if msg.get('term') < self.current_term:
                 self._step_down(msg['term'])
-                self._random_election_timeout
+                #self._random_election_timeout
                 # set the response to false if term is outdated
                 response = {
                     "type": MSG_APPEND_ENTRIES_RESPONSE,
@@ -411,7 +416,7 @@ class RaftNode:
                         
                 if self._get_log_entry(entry['index']) is None:
                     self.log.append(entry)
-                    self.save_state
+                    self.save_state()
 
             # Update commit index if leader's commit index is higher
             if leader_commit > self.commit_index:
@@ -433,7 +438,7 @@ class RaftNode:
         # TODO: Implement AppendEntries response handling
         if msg['term'] > self.current_term:
             self._step_down(msg['term'])
-            self._random_election_timeout
+            #self._random_election_timeout
             return
 
         if self.role != LEADER:
@@ -513,7 +518,7 @@ class RaftNode:
                 "request_id": msg.get("request_id")
             }
             self.log.append(entry)
-            self.save_state
+            self.save_state()
             self.commit_index = entry["index"]
             self.apply_committed()
             if self.role == LEADER:
@@ -565,7 +570,7 @@ class RaftNode:
                     "request_id": msg.get("request_id")
                 }
                 self.log.append(entry)
-                self.save_state
+                self.save_state()
                 self.commit_index = entry["index"]
                 self.apply_committed()
                 if self.role == LEADER:
@@ -680,17 +685,21 @@ class RaftNode:
             "log": self.log,
             "snapshot": None
         }
+        os.makedirs(DATA_DIR, exist_ok=True)
 
         # Define paths
         final_path = f"data/{self.node_id}.json"
         temp_path = final_path + ".tmp"
 
         # Write to temp file
-        with open(temp_path, 'w') as f:
-            json.dump(state, f)
+        try:
+            with open(temp_path, 'w') as f:
+                json.dump(state, f)
 
-        # To instantly swap between both files
-        os.replace(temp_path, final_path)
+            # To instantly swap between both files
+            os.replace(temp_path, final_path)
+        except OSError as e:
+            print(f"[{self.node_id}] Could not save state: {e}")
 
     def load_state(self):
         # TODO (Part 3): Implement state loading
@@ -745,7 +754,7 @@ class RaftNode:
         self.role = FOLLOWER
         self.voted_for = None
         self.leader_id = None
-        self.save_state
+        self.save_state()
 
 # ENTRY POINT
 
