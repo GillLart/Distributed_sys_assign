@@ -186,6 +186,11 @@ class RaftNode:
 
     def start_election(self):
         # TODO: Implement election start
+        # Don't start an election if one started very recently
+        now = time.time()
+        if now - getattr(self, '_last_election_time', 0) < 0.5:
+            return
+        self._last_election_time = now
         self.current_term += 1
         self.role = CANDIDATE
         self.voted_for = self.node_id
@@ -193,7 +198,7 @@ class RaftNode:
         self.votes_received = {self.node_id}  # Vote for self
         #self.leader_id = None
 
-        print(f"[{self.node_id}] Starting election for term {self.current_term}")
+        #print(f"[{self.node_id}] Starting election for term {self.current_term}")
 
         last_index = self._get_last_log_index()
         last_term = self._get_last_log_term()   
@@ -202,10 +207,12 @@ class RaftNode:
             self.node_id, 
             self.current_term, 
             last_index, 
-            last_term)
+            last_term,
+            )
+        msg['timestamp'] = time.time()
         #for debugging purposes, print the message being sent
         print(
-            f"[{self.node_id}] Sending REQUEST_VOTE to {self.current_term} "
+            #f"[{self.node_id}] Sending REQUEST_VOTE to {self.current_term} "
             # last index and last term should currently always be 0 as log appends haven't been implimented
             f"term={self.current_term} last_index={last_index} last_term={last_term}"
         )
@@ -239,7 +246,7 @@ class RaftNode:
             self.save_state()
             self.last_heartbeat_time = time.time()
             self.election_timeout = self._random_election_timeout()
-            print(f"[{self.node_id}] Voting FOR {msg['src']} in term {self.current_term} ")
+            #print(f"[{self.node_id}] Voting FOR {msg['src']} in term {self.current_term} ")
         
             # Success response
             response = make_request_vote_response (
@@ -248,18 +255,21 @@ class RaftNode:
                 self.current_term,
                 success = True
             )
+            self._send(response)
         else:
-            # Reject the vote
-            print(f"[{self.node_id}] Rejecting vote for {msg['src']} in term {self.current_term}")
+            # Only send rejection if the message is recent enough to be worth responding to
+            msg_age = time.time() - msg.get('timestamp', time.time())
+            if msg_age < 2.0:
+                # Reject the vote
+                #print(f"[{self.node_id}] Rejecting vote for {msg['src']} in term {self.current_term}")
+                response = make_request_vote_response (
+                    self.node_id,
+                    msg['src'],
+                    self.current_term,
+                    False
+                )
+                self._send(response)
 
-            response = make_request_vote_response (
-                self.node_id,
-                msg['src'],
-                self.current_term,
-                False
-            )
-
-        self._send(response)
 
 
     def handle_request_vote_response(self, msg):
@@ -274,7 +284,7 @@ class RaftNode:
         if  msg['term'] == self.current_term and msg['success']:
             self.votes_received.add(msg['src'])
 
-            print(f"[{self.node_id}] Vote recieved from {msg['src']}. Total votes: {len(self.votes_received)}")
+            #print(f"[{self.node_id}] Vote recieved from {msg['src']}. Total votes: {len(self.votes_received)}")
         
         # Calculate majority
         total_nodes = len(NODE_IDS)
@@ -297,13 +307,14 @@ class RaftNode:
 
             self.send_heartbeats()  # Send initial heartbeats immediately upon election
             return
-        print(f"[{self.node_id}] Received vote from {msg['src']} granted={msg['success']}")
+        #print(f"[{self.node_id}] Received vote from {msg['src']} granted={msg['success']}")
 
     # RAFT LOG REPLICATION
 
     def send_heartbeats(self):
         # TODO: Implement heartbeats / log replication
         #print(f"Active threads: {threading.active_count()}")
+        print(f"[{self.node_id}] Active threads: {threading.active_count()}")
         if self.role != LEADER:
             return
             
@@ -662,7 +673,7 @@ class RaftNode:
             self.pending_requests.add(cache_key)
             self.log.append(entry)
             self.save_state()
-            #self.send_heartbeats()
+            self.send_heartbeats()
             return
             """
             response = make_client_response(
@@ -745,6 +756,10 @@ class RaftNode:
 
     def apply_committed(self):
         # TODO: Implement state machine application
+        if not hasattr(self, 'client_response_cache'):
+            self.client_response_cache = {}
+        if not hasattr(self, 'pending_requests'):
+            self.pending_requests = set()
         # Loop through last applied and commit index
         while self.last_applied < self.commit_index:
         #for i in range(self.last_applied + 1, self.commit_index + 1):
