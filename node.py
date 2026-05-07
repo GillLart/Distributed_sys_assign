@@ -10,7 +10,7 @@ from message import (
     make_append_entries, make_request_vote, send_message, recv_message, make_register, make_client_response, make_request_vote_response,
     MSG_REGISTER_ACK, MSG_APPEND_ENTRIES, MSG_APPEND_ENTRIES_RESPONSE,
     MSG_REQUEST_VOTE, MSG_REQUEST_VOTE_RESPONSE,
-    MSG_CLIENT_REQUEST,
+    MSG_CLIENT_REQUEST,MSG_INSTALL_SNAPSHOT, MSG_INSTALL_SNAPSHOT_RESPONSE, make_install_snapshot
 )
 from config import (
     NETWORK_HOST, NETWORK_PORT, CLUSTER_SIZE, NODE_IDS,
@@ -318,7 +318,7 @@ class RaftNode:
                     entries_to_send = []
                 else:    
                     # -1 so that the raft index is converted to python index (bacuse raft atarts at 1 and py at 0)
-                    entries_to_send = self._get_log_slice
+                    entries_to_send = self._get_log_slice(first_entry)
                 
                 # Determine the previous point
                 prev_log_index = self.next_index[peer_id] - 1
@@ -337,8 +337,9 @@ class RaftNode:
                 "term": self.current_term,
                 "entries": entries_to_send,
                 "timestamp": time.time(),
-                "log_Index": prev_log_index,
-                "log_term": prev_log_term
+                "prev_log_index": prev_log_index,
+                "prev_log_term": prev_log_term,
+                "leader_commit": self.commit_index
                 }
                 
                 self._send(msg)
@@ -473,7 +474,81 @@ class RaftNode:
             if count >= (len(NODE_IDS) // 2)+1:
                 self.commit_index = index
         self.apply_committed()
+    # INSTALL SNAPSHOT
 
+    def handle_install_snapshot(self, msg):
+    # Called from _receive_loop — no lock held on entry
+        if msg.get("term") < self.current_term:
+            response = {
+                "type": MSG_INSTALL_SNAPSHOT_RESPONSE,
+                "src": self.node_id,
+                "dst": msg["src"],
+                "term": self.current_term,
+                "success": False
+            }
+            self._send(response)
+            return
+
+        # Valid snapshot from current leader — accept it
+        self.current_term = msg["term"]
+        self.role = FOLLOWER
+        self.leader_id = msg["src"]
+        self.last_heartbeat_time = time.time()
+        self.election_timeout = self._random_election_timeout()
+
+        last_included_index = msg["last_included_index"]
+        last_included_term  = msg["last_included_term"]
+        incoming_kv         = msg["data"]
+
+        # Paper rule: if our log already contains the snapshot's last entry
+        # with a matching term, keep everything after it (Section 7)
+        existing = self._get_log_entry(last_included_index)
+        if existing and existing["term"] == last_included_term:
+            # Trim only the prefix the snapshot covers
+            self.log = [e for e in self.log if e["index"] > last_included_index]
+        else:
+            # Snapshot supersedes our entire log
+            self.log = []
+
+        # Install the snapshot
+        self.snapshot = {
+            "kv_store": incoming_kv,
+            "last_included_index": last_included_index,
+            "last_included_term": last_included_term
+        }
+        self.kv_store     = dict(incoming_kv)
+        self.last_applied = last_included_index
+        self.commit_index = max(self.commit_index, last_included_index)
+        self.save_state()
+
+        print(f"[{self.node_id}] Installed snapshot up to index {last_included_index}")
+
+        response = {
+            "type": MSG_INSTALL_SNAPSHOT_RESPONSE,
+            "src": self.node_id,
+            "dst": msg["src"],
+            "term": self.current_term,
+            "success": True,
+            "match_index": last_included_index
+        }
+        self._send(response)
+
+    def handle_install_snapshot_response(self, msg):
+        # Called from _receive_loop — no lock held on entry
+        if msg["term"] > self.current_term:
+            self._step_down(msg["term"])
+            self.election_timeout = self._random_election_timeout()
+            return
+
+        if self.role != LEADER:
+            return
+
+        if msg.get("success"):
+            follower_id  = msg["src"]
+            match_index  = msg.get("match_index", 0)
+            self.match_index[follower_id] = match_index
+            self.next_index[follower_id]  = match_index + 1
+            print(f"[{self.node_id}] Snapshot accepted by {follower_id}, " f"now at index {match_index}")
     # CLIENT REQUEST HANDLING
 
     def handle_client_request(self, msg):
@@ -499,10 +574,48 @@ class RaftNode:
             #)
             #self._send(response)
             # return
-        
+        with self.lock:
+            if not hasattr(self, 'client_response_cache'):
+                self.client_response_cache = {}
+            if not hasattr(self, 'pending_requests'):
+                self.pending_requests = set()
+
+        request_id = msg.get("request_id")
+        client_id = msg["src"]
+        cache_key = (client_id, request_id)
+
+        # Return cached response if seen before
+        if cache_key in self.client_response_cache:
+            self._send(self.client_response_cache[cache_key])
+            return
+
+        # If already in log but not committed, don't append again
+        if cache_key in self.pending_requests:
+            return
         # do a get and put operation on the kv store for debugging purposes
         operation = msg.get('operation', '').upper()
-        key = msg.get('key')  
+        key = msg.get('key') 
+
+        # Forward to leader if not leader
+        if self.role != LEADER:
+            hops = msg.get("forward_hops", 0)
+            if hops >= 8:
+                return
+            if self.leader_id is not None:
+                forward_msg = dict(msg)
+                forward_msg['dst'] = self.leader_id
+                forward_msg["forward_hops"] = hops + 1
+                self._send(forward_msg)
+                return
+            for peer_id in NODE_IDS:
+                if peer_id == self.node_id:
+                    continue
+                forward_msg = dict(msg)
+                forward_msg["dst"] = peer_id
+                forward_msg["forward_hops"] = hops + 1
+                self._send(forward_msg)
+            return
+
         if  operation == "PUT":
             value = msg.get('value')
             # changed self.kv_store[key] = value to append to the log
@@ -517,6 +630,7 @@ class RaftNode:
                 "client_id": msg['src'],
                 "request_id": msg.get("request_id")
             }
+            self.pending_requests.add(cache_key)
             self.log.append(entry)
             self.save_state()
             self.commit_index = entry["index"]
@@ -536,7 +650,7 @@ class RaftNode:
             """
         elif operation == "GET":
             if key in self.kv_store:
-                value = self.kv_store[key]
+                #value = self.kv_store[key]
                 response = make_client_response(
                     self.node_id,
                     msg['src'],
@@ -544,7 +658,6 @@ class RaftNode:
                     success=True,
                     value=self.kv_store[key]
                 )
-                print("RESPONSE:", response)
             else:
                 response = make_client_response(
                     self.node_id,
@@ -553,7 +666,10 @@ class RaftNode:
                     success=False,
                     error=f"Key '{key}' not found"
                 )
-                print("RESPONSE:", response)
+            #print("RESPONSE:", response)
+            self.client_response_cache[cache_key] = response
+            self._send(response)
+            return
 
         elif operation == "DELETE":
             # also changed this to read from the log 
@@ -569,6 +685,7 @@ class RaftNode:
                     "client_id": msg['src'],
                     "request_id": msg.get("request_id")
                 }
+                self.pending_requests.add(cache_key)
                 self.log.append(entry)
                 self.save_state()
                 self.commit_index = entry["index"]
@@ -589,16 +706,15 @@ class RaftNode:
                 )
                 print("RESPONSE:", response)
                 """
-
-        else :
-            response = make_client_response(
-                self.node_id,
-                msg['src'],
-                request_id=msg.get("request_id"),
-                success=False,
-                error=f"Unknown operation: {msg.get('operation')}"
-            )
-        print(f"[{self.node_id}] SENDING RESPONSE:", response)
+        response = make_client_response(
+            self.node_id,
+            msg['src'],
+            request_id=msg.get("request_id"),
+            success=False,
+            error=f"Unknown operation: {msg.get('operation')}"
+        )
+        #print(f"[{self.node_id}] SENDING RESPONSE:", response)
+        self.client_response_cache[cache_key] = response
         self._send(response)
 
 

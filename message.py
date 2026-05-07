@@ -32,7 +32,9 @@ MSG_APPEND_ENTRIES_RESPONSE = "APPEND_ENTRIES_RESPONSE"
 MSG_REQUEST_VOTE = "REQUEST_VOTE"
 MSG_REQUEST_VOTE_RESPONSE = "REQUEST_VOTE_RESPONSE"
 
-
+# Install snapshot
+MSG_INSTALL_SNAPSHOT = "INSTALL_SNAPSHOT"
+MSG_INSTALL_SNAPSHOT_RESPONSE = "INSTALL_SNAPSHOT_RESPONSE"
 # === Wire Protocol ===
 
 def send_message(sock, msg_dict):
@@ -194,3 +196,15 @@ def make_handle_append_entries( node_id, current_term, success):
                 "term": current_term,
                 "success": success
             }
+
+def make_install_snapshot(node_id, peer_id, term, last_included_index,
+                        last_included_term, kv_store):
+    return {
+                "type": MSG_INSTALL_SNAPSHOT,
+                "src": node_id,
+                "dst": peer_id,
+                "term": term,
+                "last_included_index": last_included_index,
+                "last_included_term": last_included_term,
+                "data": kv_store,   # full kv_store dict as snapshot payload
+    }
