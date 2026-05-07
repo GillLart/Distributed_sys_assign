@@ -319,6 +319,22 @@ class RaftNode:
                 # Determine what to send
                 # guarding against invalid index and empty log
                 first_entry = self.next_index[peer_id]
+
+                # If follower needs entries we have already snapshotted,
+                # send snapshot directly instead of AppendEntries
+                snapshot = getattr(self, 'snapshot', None)
+                if snapshot and first_entry <= snapshot['last_included_index']:
+                    install_msg = make_install_snapshot(
+                        self.node_id,
+                        peer_id,
+                        self.current_term,
+                        snapshot['last_included_index'],
+                        snapshot['last_included_term'],
+                        snapshot['kv_store']
+                    )
+                    self._send(install_msg)
+                    continue
+
                 if first_entry <=0:
                     entries_to_send = self.log
                 elif first_entry > len(self.log):
@@ -595,6 +611,7 @@ class RaftNode:
                 return
 
             if self.role != LEADER:
+                print(f"[{self.node_id}] Ignoring snapshot response - not leader")
                 return
 
             if msg.get("success"):

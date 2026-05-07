@@ -199,7 +199,7 @@ def make_handle_append_entries( node_id, current_term, success):
             }
 
 def make_install_snapshot(node_id, peer_id, term, last_included_index,
-                        last_included_term, kv_store):
+                        last_included_term, data):
     return {
                 "type": MSG_INSTALL_SNAPSHOT,
                 "src": node_id,
@@ -207,5 +207,5 @@ def make_install_snapshot(node_id, peer_id, term, last_included_index,
                 "term": term,
                 "last_included_index": last_included_index,
                 "last_included_term": last_included_term,
-                "data": kv_store,   # full kv_store dict as snapshot payload
+                "data": data
     }
