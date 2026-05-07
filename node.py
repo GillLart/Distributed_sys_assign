@@ -10,7 +10,7 @@ from message import (
     make_append_entries, make_request_vote, send_message, recv_message, make_register, make_client_response, make_request_vote_response,
     MSG_REGISTER_ACK, MSG_APPEND_ENTRIES, MSG_APPEND_ENTRIES_RESPONSE,
     MSG_REQUEST_VOTE, MSG_REQUEST_VOTE_RESPONSE,
-    MSG_CLIENT_REQUEST,
+    MSG_CLIENT_REQUEST, MSG_INSTALL_SNAPSHOT, MSG_INSTALL_SNAPSHOT_RESPONSE, make_install_snapshot
 )
 from config import (
     NETWORK_HOST, NETWORK_PORT, CLUSTER_SIZE, NODE_IDS,
@@ -602,6 +602,79 @@ class RaftNode:
             for _ in range(3):
                 threading.Timer(0.05 * _, lambda: self.role == LEADER and self.send_heartbeats()).start()
         """
+    def handle_install_snapshot(self, msg):
+    # Called from _receive_loop — no lock held on entry
+        if msg.get("term") < self.current_term:
+            response = {
+                "type": MSG_INSTALL_SNAPSHOT_RESPONSE,
+                "src": self.node_id,
+                "dst": msg["src"],
+                "term": self.current_term,
+                "success": False
+            }
+            self._send(response)
+            return
+
+        # Valid snapshot from current leader — accept it
+        self.current_term = msg["term"]
+        self.role = FOLLOWER
+        self.leader_id = msg["src"]
+        self.last_heartbeat_time = time.time()
+        self.election_timeout = self._random_election_timeout()
+
+        last_included_index = msg["last_included_index"]
+        last_included_term  = msg["last_included_term"]
+        incoming_kv         = msg["data"]
+
+        # Paper rule: if our log already contains the snapshot's last entry
+        # with a matching term, keep everything after it (Section 7)
+        existing = self._get_log_entry(last_included_index)
+        if existing and existing["term"] == last_included_term:
+            # Trim only the prefix the snapshot covers
+            self.log = [e for e in self.log if e["index"] > last_included_index]
+        else:
+            # Snapshot supersedes our entire log
+            self.log = []
+
+        # Install the snapshot
+        self.snapshot = {
+            "kv_store": incoming_kv,
+            "last_included_index": last_included_index,
+            "last_included_term": last_included_term
+        }
+        self.kv_store     = dict(incoming_kv)
+        self.last_applied = last_included_index
+        self.commit_index = max(self.commit_index, last_included_index)
+        self.save_state()
+
+        print(f"[{self.node_id}] Installed snapshot up to index {last_included_index}")
+
+        response = {
+            "type": MSG_INSTALL_SNAPSHOT_RESPONSE,
+            "src": self.node_id,
+            "dst": msg["src"],
+            "term": self.current_term,
+            "success": True,
+            "match_index": last_included_index
+        }
+        self._send(response)
+
+    def handle_install_snapshot_response(self, msg):
+        # Called from _receive_loop — no lock held on entry
+        if msg["term"] > self.current_term:
+            self._step_down(msg["term"])
+            self.election_timeout = self._random_election_timeout()
+            return
+
+        if self.role != LEADER:
+            return
+
+        if msg.get("success"):
+            follower_id  = msg["src"]
+            match_index  = msg.get("match_index", 0)
+            self.match_index[follower_id] = match_index
+            self.next_index[follower_id]  = match_index + 1
+            print(f"[{self.node_id}] Snapshot accepted by {follower_id}, " f"now at index {match_index}")
     # CLIENT REQUEST HANDLING
 
     def handle_client_request(self, msg):
