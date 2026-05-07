@@ -142,6 +142,10 @@ class RaftNode:
             self.handle_request_vote_response(msg)
         elif msg_type == MSG_CLIENT_REQUEST:
             self.handle_client_request(msg)
+        elif msg_type == MSG_INSTALL_SNAPSHOT:       
+            self.handle_install_snapshot(msg)          
+        elif msg_type == MSG_INSTALL_SNAPSHOT_RESPONSE: 
+            self.handle_install_snapshot_response(msg) 
         # Ignore unknown message types silently
 
     def _send(self, msg):
@@ -186,9 +190,17 @@ class RaftNode:
 
     def start_election(self):
         # TODO: Implement election start
+
+        # Rate limit elections to prevent split vote livelock
+        now = time.time()
+        if now - getattr(self, '_last_election_time', 0) < ELECTION_TIMEOUT_MIN:
+            self.last_heartbeat_time = now  # back off, don't fire again immediately
+            return
+        self._last_election_time = now
         self.current_term += 1
         self.role = CANDIDATE
         self.voted_for = self.node_id
+        self.save_state()
         self.votes_received = {self.node_id}  # Vote for self
         self.leader_id = None
 
@@ -214,99 +226,94 @@ class RaftNode:
 
     def handle_request_vote(self, msg):
         #thie is the version that doesn't cause a error
-        if msg['term'] > self.current_term:
-            self._step_down(msg['term'])
-            #self._random_election_timeout
-            #vote_granted = False # Reject vote
+        with self.lock:
+            if msg['term'] > self.current_term:
+                self._step_down(msg['term'])
+                #self._random_election_timeout
+                #vote_granted = False # Reject vote
 
-        my_last_term = self._get_last_log_term()
-        my_last_index = self._get_last_log_index()
+            my_last_term = self._get_last_log_term()
+            my_last_index = self._get_last_log_index()
 
-        candidate_last_term = msg['last_log_term']
-        candidate_last_index = msg['last_log_index']
+            candidate_last_term = msg['last_log_term']
+            candidate_last_index = msg['last_log_index']
 
-        # Checking for higher term, then if equal term checking for longer index
-        log_check = (
-        (candidate_last_term > my_last_term) or ((candidate_last_term == my_last_term) and (candidate_last_index >= my_last_index))
-        )
-
-        # If had not voted yet or already voted for a specfic candidate 
-        if msg['term'] == self.current_term and (self.voted_for is None or self.voted_for == msg['src']) and \
-        log_check:
-            # Grant the vote
-            #vote_granted = True
-            self.voted_for = msg['src']
-            self.save_state()
-            self.last_heartbeat_time = time.time()
-            self.election_timeout = self._random_election_timeout()
-            print(f"[{self.node_id}] Voting FOR {msg['src']} in term {self.current_term} ")
-        
-            # Success response
-            response = make_request_vote_response (
-                self.node_id,
-                msg['src'],
-                self.current_term,
-                success =True
+            # Checking for higher term, then if equal term checking for longer index
+            log_check = (
+            (candidate_last_term > my_last_term) or ((candidate_last_term == my_last_term) and (candidate_last_index >= my_last_index))
             )
-            self._send(response)
-        else:
-            msg_age = time.time() - msg.get('timestamp', time.time())
-            # Reject the vote
-            if msg_age < 2.0:
-                print(f"[{self.node_id}] Rejecting vote for {msg['src']} in term {self.current_term}")
 
-                response = make_request_vote_response (
-                    self.node_id,
-                    msg['src'],
-                    self.current_term,
-                    False
-                )
+            if msg['term'] == self.current_term and (self.voted_for is None or self.voted_for == msg['src']) and log_check:
+                self.voted_for = msg['src']
+                self.save_state()
+                self.last_heartbeat_time = time.time()
+                self.election_timeout = self._random_election_timeout()
+                print(f"[{self.node_id}] Voting FOR {msg['src']} in term {self.current_term}")
+                grant = True
+            else:
+                msg_age = time.time() - msg.get('timestamp', time.time())
+                grant = None  # None means don't respond
+                if msg_age < 2.0:
+                    grant = False
+                    print(f"[{self.node_id}] Rejecting vote for {msg['src']} in term {self.current_term}")
+                    # Back off slightly even on rejection to reduce split votes
+                    self.last_heartbeat_time = time.time()
+                    self.election_timeout = self._random_election_timeout()
 
-                self._send(response)
+        if grant is True:
+            self._send(make_request_vote_response(self.node_id, msg['src'], self.current_term, success=True))
+        elif grant is False:
+            self._send(make_request_vote_response(self.node_id, msg['src'], self.current_term, False))
 
 
     def handle_request_vote_response(self, msg):
-        if msg['term'] > self.current_term:
-            self._step_down(msg['term'])
-            #self._random_election_timeout
-            return
-        # To care about the votes, make sure are candiate
-        if self.role != CANDIDATE:
-            return
+
+        send_heartbeat = False
+        with self.lock:
+            if msg['term'] > self.current_term:
+                self._step_down(msg['term'])
+                #self._random_election_timeout
+                return
+            # To care about the votes, make sure are candiate
+            if self.role != CANDIDATE:
+                return
+            
+            # Only count the vote if it's for the current election year
+            if  msg['term'] == self.current_term and msg['success']:
+                self.votes_received.add(msg['src'])
+
+                print(f"[{self.node_id}] Vote recieved from {msg['src']}. Total votes: {len(self.votes_received)}")
+            
+            # Calculate majority
+            total_nodes = len(NODE_IDS)
+            majority_votes = (total_nodes // 2) + 1
+
+            # Finding out the newly appointed leader
+            if len(self.votes_received) >= majority_votes:
+                self.role = LEADER
+                self.leader_id = self.node_id
+                self.last_heartbeat_time = time.time()
+                # incrament the next index for each follower to be one more than the last log index 
+                # (as the leader would try to send new entries starting from there)
+                next_log_index = self._get_last_log_index() + 1
+                for peer_id in NODE_IDS:
+                    if peer_id != self.node_id:
+                        self.next_index[peer_id] = next_log_index
+                        self.match_index[peer_id] = 0
+
+                print(f"[{self.node_id}] I am now the LEADER for term {self.current_term}")
+                send_heartbeat = True
+                #self.send_heartbeats()  # Send initial heartbeats immediately upon election
+            print(f"[{self.node_id}] Received vote from {msg['src']} granted={msg['success']}")
         
-        # Only count the vote if it's for the current election year
-        if  msg['term'] == self.current_term and msg['success']:
-            self.votes_received.add(msg['src'])
-
-            print(f"[{self.node_id}] Vote recieved from {msg['src']}. Total votes: {len(self.votes_received)}")
-        
-        # Calculate majority
-        total_nodes = len(NODE_IDS)
-        majority_votes = (total_nodes // 2) + 1
-
-        # Finding out the newly appointed leader
-        if len(self.votes_received) >= majority_votes:
-            self.role = LEADER
-            self.leader_id = self.node_id
-            self.last_heartbeat_time = time.time()
-            # incrament the next index for each follower to be one more than the last log index 
-            # (as the leader would try to send new entries starting from there)
-            next_log_index = self._get_last_log_index() + 1
-            for peer_id in NODE_IDS:
-                if peer_id != self.node_id:
-                    self.next_index[peer_id] = next_log_index
-                    self.match_index[peer_id] = 0
-
-            print(f"[{self.node_id}] I am now the LEADER for term {self.current_term}")
-
-            self.send_heartbeats()  # Send initial heartbeats immediately upon election
-        print(f"[{self.node_id}] Received vote from {msg['src']} granted={msg['success']}")
-
+        if send_heartbeat:
+            self.send_heartbeats()
     # RAFT LOG REPLICATION
 
     def send_heartbeats(self):
         # TODO: Implement heartbeats / log replication
-
+        if self.role != LEADER:
+            return
         for peer_id in NODE_IDS:
             if peer_id != self.node_id:
                 # Determine what to send
@@ -349,19 +356,22 @@ class RaftNode:
         # TODO: Implement AppendEntries handling
         # Reset election timeout when receiving a valid heartbeat. For now, you do not need to handle log entries or consistency checks (those are added in Part 2)
         # part 2: Check that the previous log entry matches (same index and term) before accepting new entries. If the check fails, respond with `success=False`. If it passes, append the new entries to the log and update `commit_index` if the leader's commit index is higher 
+        send_rejection = False
+        needs_apply = False 
+        response = None 
         with self.lock:
             if msg.get('term') < self.current_term:
-                self._step_down(msg['term'])
+                #self._step_down(msg['term'])
                 #self._random_election_timeout
                 # set the response to false if term is outdated
-                response = {
-                    "type": MSG_APPEND_ENTRIES_RESPONSE,
-                    "src": self.node_id,    
-                    "dst": msg['src'],
-                    "term": self.current_term,
-                    "success": False
-                }
+                send_rejection = True
+                msg_age = time.time() - msg.get('timestamp', time.time())
+                if msg_age < 2.0:
+                    self.last_heartbeat_time = time.time()
+                    self.election_timeout = self._random_election_timeout()
             else:
+                if msg.get('term') > self.current_term:
+                    self._step_down(msg['term'])
                 # # Reset election timeout when valid heartbeat recived
                 self.current_term = msg.get('term')
                 self.role = FOLLOWER
@@ -369,115 +379,118 @@ class RaftNode:
                 self.last_heartbeat_time = time.time() #
                 # Reset election timeout is randomised so that one node times out earlier and becomes a candidite first the next election. 
                 self.election_timeout = self._random_election_timeout()
+                
+                prev_log_index = msg.get('prev_log_index', 0)
+                prev_log_term = msg.get('prev_log_term', 0)
+                entries = msg.get('entries', [])
+                leader_commit = msg.get('leader_commit', 0)
+               
+                if prev_log_index > 0:
+                    local_prev_entry = self._get_log_entry(prev_log_index)
+                    if local_prev_entry is None or local_prev_entry['term'] != prev_log_term:                                          
+                        # store for sending outside lock
+                        send_rejection = True
+                        #rejection_response = response
+                if not send_rejection:
+                    # Append new entries to the log
+                    for entry in entries: 
+                        # Hard absolute cap on log size
+                        if len(self.log) >= SNAPSHOT_THRESHOLD:
+                            break
+                        # Don't let log grow more than threshold ahead of commit index
+                        if entry['index'] - self.commit_index > SNAPSHOT_THRESHOLD:
+                            break
+                        existing = self._get_log_entry(entry['index'])
+                        if existing is not None and existing['term'] != entry['term']:
+                            # Conflict detected, delete the existing entry and all that follow it
+                            self.log = [e for e in self.log if e['index'] < entry['index']]
+                            self.save_state()
+                                
+                        if self._get_log_entry(entry['index']) is None:
+                            self.log.append(entry)
+                            self.save_state()
+                            print(f"[{self.node_id}] APPENDED entry index={entry['index']}")
 
-                response = {
-                    "type": MSG_APPEND_ENTRIES_RESPONSE,
-                    "src": self.node_id,
-                    "dst": msg['src'],
-                    "term": self.current_term,
-                    "success": True
-                }
-                self._send(response)
-                return
-            # # Reset election timeout when valid heartbeat recived
-            self.current_term = msg.get('term')
-            self.role = FOLLOWER
-            self.leader_id = msg['src']
-            self.last_heartbeat_time = time.time() #
-            # Reset election timeoutis randomised so that one node times out earlier and becomes a candidite first the next election. 
-            self.election_timeout = self._random_election_timeout()
-
-            prev_log_index = msg.get('prev_log_index',0)
-            prev_log_term = msg.get('prev_log_term',0)
-            entries = msg.get('entries', [])
-            leader_commit = msg.get('leader_commit', 0)
-
-            # check previous log entry matches
-            if prev_log_index > 0:
-                # also added check for if follower log is empty
-                local_prev_entry = self._get_log_entry(prev_log_index)
-                if local_prev_entry is None or local_prev_entry != prev_log_term:
-                    # Previous log entry does not match, reject the AppendEntries
+                    # Update commit index if leader's commit index is higher
+                    needs_apply = leader_commit > self.commit_index
+                    if needs_apply:
+                        self.commit_index = min(leader_commit, self._get_last_log_index())
+                        #self.apply_committed() 
+                        
                     response = {
                         "type": MSG_APPEND_ENTRIES_RESPONSE,
                         "src": self.node_id,
                         "dst": msg['src'],
                         "term": self.current_term,
-                        "success": False,
-                        "match_index": self._get_last_log_index()
+                        "success": True,
+                        "match_index":self._get_last_log_index()
                     }
-                    self._send(response)
-                    return
-            # Append new entries to the log
-            for entry in entries: 
-                existing = self._get_log_entry(entry['index'])
-                if existing is not None and existing['term'] != entry['term']:
-                        # Conflict detected, delete the existing entry and all that follow it
-                        self.log = [e for e in self.log if e['index'] < entry['index']]
-                        
-                if self._get_log_entry(entry['index']) is None:
-                    self.log.append(entry)
-                    self.save_state()
-
-            # Update commit index if leader's commit index is higher
-            if leader_commit > self.commit_index:
-                self.commit_index = min(leader_commit, self._get_last_log_index())
-                # Apply any newly committed entries to the state machine
-                self.apply_committed() 
-                
-            response = {
+        # All sends outside lock
+        if send_rejection:
+            rejection_response = {
                 "type": MSG_APPEND_ENTRIES_RESPONSE,
                 "src": self.node_id,
                 "dst": msg['src'],
                 "term": self.current_term,
-                "success": True,
-                "match_index":self._get_last_log_index()
+                "success": False
             }
-        self._send(response)
+            self._send(rejection_response)
+            return
+        #now called outside the lock to prevent any deadlocks that could be caused by the has attr in applu_committed
+        if response is not None:  # guard against None
+            self._send(response)
+        if needs_apply:
+            self.apply_committed()
+        # Compact log if it has grown too large regardless of commit status
+        if len(self.log) > SNAPSHOT_THRESHOLD:
+            self.take_snapshot()
 
     def handle_append_entries_response(self, msg):
         # TODO: Implement AppendEntries response handling
-        if msg['term'] > self.current_term:
-            self._step_down(msg['term'])
-            #self._random_election_timeout
-            return
+        with self.lock:
+            if msg['term'] > self.current_term:
+                self._step_down(msg['term'])
+                #self._random_election_timeout
+                return
 
-        if self.role != LEADER:
-            return
-        
-        # added a bit of backtracking to handle failed append. simple not fully implemeted
-        if not msg.get('success', False):
-            self.next_index[msg['src']] = max(1, self.next_index.get(msg['src'], 1) - 1)
-            return
-        
-        #sucessful then followers match up to the index
-        follower_match_index = msg.get('match_index', self._get_last_log_index())
-        self.match_index[msg['src']] = follower_match_index
-        self.next_index[msg['src']] = follower_match_index + 1
-        # Check if there are any new entries that can be committed
-        for index in range(self.commit_index + 1, self._get_last_log_index() + 1):
-            entry = self._get_log_entry(index)
-            if entry is None:
-                continue
-            #only commit entries from current term
-            if entry['term'] != self.current_term:
-                continue
-            # this should be the leader's own log, so it counts as a match
-            count = 1  
-
-            for peer_id in NODE_IDS:
-                if peer_id == self.node_id:
+            if self.role != LEADER:
+                return
+            
+            # added a bit of backtracking to handle failed append. simple not fully implemeted
+            if not msg.get('success', False):
+                #with self.lock:
+                self.next_index[msg['src']] = max(1, self.next_index.get(msg['src'], 1) - 1)
+                return
+            
+            #sucessful then followers match up to the index
+            follower_match_index = msg.get('match_index', self._get_last_log_index())   
+            self.match_index[msg['src']] = follower_match_index
+            self.next_index[msg['src']] = follower_match_index + 1
+            # Check if there are any new entries that can be committed
+            for index in range(self.commit_index + 1, self._get_last_log_index() + 1):
+                entry = self._get_log_entry(index)
+                if entry is None:
                     continue
-                if self.match_index.get(peer_id, 0) >= index:
-                    count += 1
+                #only commit entries from current term
+                if entry['term'] != self.current_term:
+                    continue
+                # this should be the leader's own log, so it counts as a match
+                count = 1  
 
-            if count >= (len(NODE_IDS) // 2)+1:
-                self.commit_index = index
+                for peer_id in NODE_IDS:
+                    if peer_id == self.node_id:
+                        continue
+                    if self.match_index.get(peer_id, 0) >= index:
+                        count += 1
+
+                if count >= (len(NODE_IDS) // 2)+1:
+                    self.commit_index = index
+                    print(f"[{self.node_id}] COMMITTED index {index} with {count} votes") 
         self.apply_committed()
     # INSTALL SNAPSHOT
 
     def handle_install_snapshot(self, msg):
-    # Called from _receive_loop — no lock held on entry
+        # Called from _receive_loop — no lock held on entry
         if msg.get("term") < self.current_term:
             response = {
                 "type": MSG_INSTALL_SNAPSHOT_RESPONSE,
@@ -488,37 +501,37 @@ class RaftNode:
             }
             self._send(response)
             return
+        with self.lock:
+            # Valid snapshot from current leader — accept it
+            self.current_term = msg["term"]
+            self.role = FOLLOWER
+            self.leader_id = msg["src"]
+            self.last_heartbeat_time = time.time()
+            self.election_timeout = self._random_election_timeout()
 
-        # Valid snapshot from current leader — accept it
-        self.current_term = msg["term"]
-        self.role = FOLLOWER
-        self.leader_id = msg["src"]
-        self.last_heartbeat_time = time.time()
-        self.election_timeout = self._random_election_timeout()
+            last_included_index = msg["last_included_index"]
+            last_included_term  = msg["last_included_term"]
+            incoming_kv         = msg["data"]
 
-        last_included_index = msg["last_included_index"]
-        last_included_term  = msg["last_included_term"]
-        incoming_kv         = msg["data"]
+            # Paper rule: if our log already contains the snapshot's last entry
+            # with a matching term, keep everything after it (Section 7)
+            existing = self._get_log_entry(last_included_index)
+            if existing and existing["term"] == last_included_term:
+                # Trim only the prefix the snapshot covers
+                self.log = [e for e in self.log if e["index"] > last_included_index]
+            else:
+                # Snapshot supersedes our entire log
+                self.log = []
 
-        # Paper rule: if our log already contains the snapshot's last entry
-        # with a matching term, keep everything after it (Section 7)
-        existing = self._get_log_entry(last_included_index)
-        if existing and existing["term"] == last_included_term:
-            # Trim only the prefix the snapshot covers
-            self.log = [e for e in self.log if e["index"] > last_included_index]
-        else:
-            # Snapshot supersedes our entire log
-            self.log = []
-
-        # Install the snapshot
-        self.snapshot = {
-            "kv_store": incoming_kv,
-            "last_included_index": last_included_index,
-            "last_included_term": last_included_term
-        }
-        self.kv_store     = dict(incoming_kv)
-        self.last_applied = last_included_index
-        self.commit_index = max(self.commit_index, last_included_index)
+            # Install the snapshot
+            self.snapshot = {
+                "kv_store": incoming_kv,
+                "last_included_index": last_included_index,
+                "last_included_term": last_included_term
+            }
+            self.kv_store     = dict(incoming_kv)
+            self.last_applied = last_included_index
+            self.commit_index = max(self.commit_index, last_included_index)
         self.save_state()
 
         print(f"[{self.node_id}] Installed snapshot up to index {last_included_index}")
@@ -534,21 +547,22 @@ class RaftNode:
         self._send(response)
 
     def handle_install_snapshot_response(self, msg):
-        # Called from _receive_loop — no lock held on entry
-        if msg["term"] > self.current_term:
-            self._step_down(msg["term"])
-            self.election_timeout = self._random_election_timeout()
-            return
+        with self.lock:
+            # Called from _receive_loop — no lock held on entry
+            if msg["term"] > self.current_term:
+                self._step_down(msg["term"])
+                #self.election_timeout = self._random_election_timeout()
+                return
 
-        if self.role != LEADER:
-            return
+            if self.role != LEADER:
+                return
 
-        if msg.get("success"):
-            follower_id  = msg["src"]
-            match_index  = msg.get("match_index", 0)
-            self.match_index[follower_id] = match_index
-            self.next_index[follower_id]  = match_index + 1
-            print(f"[{self.node_id}] Snapshot accepted by {follower_id}, " f"now at index {match_index}")
+            if msg.get("success"):
+                follower_id  = msg["src"]
+                match_index  = msg.get("match_index", 0)
+                self.match_index[follower_id] = match_index
+                self.next_index[follower_id]  = match_index + 1
+                print(f"[{self.node_id}] Snapshot accepted by {follower_id}, " f"now at index {match_index}")
     # CLIENT REQUEST HANDLING
 
     def handle_client_request(self, msg):
@@ -598,20 +612,12 @@ class RaftNode:
 
         # Forward to leader if not leader
         if self.role != LEADER:
-            hops = msg.get("forward_hops", 0)
-            if hops >= 8:
-                return
             if self.leader_id is not None:
+                hops = msg.get("forward_hops", 0)
+                if hops >= 3:
+                    return
                 forward_msg = dict(msg)
                 forward_msg['dst'] = self.leader_id
-                forward_msg["forward_hops"] = hops + 1
-                self._send(forward_msg)
-                return
-            for peer_id in NODE_IDS:
-                if peer_id == self.node_id:
-                    continue
-                forward_msg = dict(msg)
-                forward_msg["dst"] = peer_id
                 forward_msg["forward_hops"] = hops + 1
                 self._send(forward_msg)
             return
@@ -633,21 +639,12 @@ class RaftNode:
             self.pending_requests.add(cache_key)
             self.log.append(entry)
             self.save_state()
-            self.commit_index = entry["index"]
-            self.apply_committed()
+            #self.commit_index = entry["index"]
+            #self.apply_committed()
             if self.role == LEADER:
                 self.send_heartbeats()
             return
-            """
-            response = make_client_response(
-                self.node_id,
-                msg['src'],
-                request_id=msg.get("request_id"),
-                success = True,
-                value = value
-            )
 
-            """
         elif operation == "GET":
             if key in self.kv_store:
                 #value = self.kv_store[key]
@@ -688,24 +685,12 @@ class RaftNode:
                 self.pending_requests.add(cache_key)
                 self.log.append(entry)
                 self.save_state()
-                self.commit_index = entry["index"]
-                self.apply_committed()
+                #self.commit_index = entry["index"]
+                #self.apply_committed()
                 if self.role == LEADER:
                     self.send_heartbeats()
                 return
 
-                """
-                response = make_client_response(
-                    self.node_id,
-                    msg['src'],
-                    request_id=msg.get("request_id"),
-                    success=True,
-                    value=None,
-                    client_id=msg['src'],
-                    request_id=msg.get("request_id")
-                )
-                print("RESPONSE:", response)
-                """
         response = make_client_response(
             self.node_id,
             msg['src'],
@@ -722,7 +707,10 @@ class RaftNode:
 
     def apply_committed(self):
         # TODO: Implement state machine application
-        
+        if not hasattr(self, 'client_response_cache'):
+            self.client_response_cache = {}
+        if not hasattr(self, 'pending_requests'):
+            self.pending_requests = set()
         # Loop through last applied and commit index
         while self.last_applied < self.commit_index:
         #for i in range(self.last_applied + 1, self.commit_index + 1):
@@ -741,6 +729,8 @@ class RaftNode:
             key = cmd.get('key')
             value = cmd.get('value')
 
+            if operation == "SNAPSHOT":
+                continue
             # Apply this entry's data to the key store
             # handling for put/ overwrites
             if operation == "PUT":
@@ -763,9 +753,11 @@ class RaftNode:
                 success = False
                 error = f"Unknown operation: {operation}"
                 responce_value = None
-            
+
+            client_id = entry.get("client_id")
+            request_id = entry.get("request_id")
             # If leader, send response using this entry's metadata
-            if entry.get("client_id") is not None:
+            if client_id is not None and request_id is not None:
                 response = make_client_response(
                     self.node_id,
                     # Use the ID form the log entry 
@@ -775,19 +767,61 @@ class RaftNode:
                     value = responce_value,
                     error = error
                 )
+                cache_key = (client_id, request_id)
+                self.client_response_cache[cache_key] = response
+                self.pending_requests.discard(cache_key)
                 self._send(response)
         # To update the pointer  
         self.last_applied = self.commit_index
+        if len(self.log) > SNAPSHOT_THRESHOLD:
+            self.take_snapshot()
 
     # CHECKPOINTING / SNAPSHOTTING (Part 3)
 
     def take_snapshot(self):
         # TODO (Part 3): Implement snapshotting
-        pass
+        # Use last_applied if we have committed entries,
+        # otherwise use the last log index we have
+        snapshot_index = self.last_applied if self.last_applied > 0 else self._get_last_log_index()
+        
+        if snapshot_index == 0:
+            return  # truly nothing to snapshot
+        
+        last_included_index = snapshot_index
+        last_included_term = self._get_log_term(last_included_index)
+
+        self.snapshot = {
+            "kv_store": self.kv_store.copy(),
+            "last_included_index": last_included_index,
+            #to preserve log consistency after old log entries are deleted
+            "last_included_term": last_included_term
+        }
+        #keep just the logs after the snapshot 
+        self.log = [{
+            "index":last_included_index,
+            "term":last_included_term,
+            "command":{"operation":"SNAPSHOT"}
+        }]+[
+            entry for entry in self.log if entry['index'] > last_included_index
+            ]
+        
+        #self.snapshot=snap
+        self.save_state()
 
     def load_snapshot(self, snapshot_data):
         # TODO (Part 3): Implement snapshot loading
-        pass
+        # is theres no snapshot data then return
+        if snapshot_data is None:
+            return
+
+        # Update the key-value store
+        self.kv_store = snapshot_data.get("kv_store", {}).copy()
+        last_included_index = snapshot_data.get("last_included_index", 0)
+
+        self.last_applied = last_included_index
+        self.commit_index = last_included_index
+
+        self.snapshot = snapshot_data
 
     # STATE PERSISTENCE (Part 3)
 
@@ -799,7 +833,7 @@ class RaftNode:
             "current_term": self.current_term,
             "voted_for": self.voted_for,
             "log": self.log,
-            "snapshot": None
+            "snapshot": getattr(self, "snapshot", None)
         }
         os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -824,18 +858,28 @@ class RaftNode:
         file_path = f"data/{self.node_id}.json"
         
         # Check if the file exists
-        if os.path.exists(file_path):
+        if not os.path.exists(file_path):
+            return
+            
+        try:
             # Open and read the file
             with open(file_path, 'r') as f:
                 data = json.load(f) # Turn text into a python dictionary
-        else:
-            return # Return nothing if file does not exist
+        except json.JSONDecodeError:
+            print(f"[{self.node_id}] Corrupted state file, deleting it")
+            os.remove(file_path)
+            return
+        except OSError as e:
+            print(f"[{self.node_id}] Could not load state: {e}")
+            return      
 
         # Update the variables
         self.current_term = data.get('current_term', 0)
         self.voted_for = data.get('voted_for')
         self.log = data.get('log', [])
-
+        self.snapshot = data.get("snapshot", None) 
+        if self.snapshot is not None:           
+            self.load_snapshot(self.snapshot)   
     # HELPER METHODS 
 
     def _get_last_log_index(self):

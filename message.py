@@ -15,7 +15,7 @@
 
 import json
 import struct
-
+import time
 # === Message Type Constants ===
 
 # Registration (node/client <-> network)
@@ -186,6 +186,7 @@ def make_request_vote(node_id,current_term,last_index, last_term):
                 "term": current_term,
                 "last_log_index": last_index,
                 "last_log_term": last_term,
+                "timestamp": time.time() 
             }
 
 def make_handle_append_entries( node_id, current_term, success):
