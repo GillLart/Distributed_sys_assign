@@ -447,10 +447,14 @@ class RaftNode:
 
     def handle_append_entries_response(self, msg):
         # TODO: Implement AppendEntries response handling
-        to_serve = []
-        kv_snapshot = {}
+        reads_to_serve = []
+        #kv_snapshot = {}
 
         with self.lock:
+            if not hasattr(self, 'pending_reads'):
+                self.pending_reads = {}
+            if not hasattr(self, 'client_response_cache'):
+                self.client_response_cache = {}
             if msg['term'] > self.current_term:
                 self._step_down(msg['term'])
                 #self._random_election_timeout
@@ -489,55 +493,40 @@ class RaftNode:
                 if count >= (len(NODE_IDS) // 2)+1:
                     self.commit_index = index
                     print(f"[{self.node_id}] COMMITTED index {index} with {count} votes")
-                
-            # ReadIndex: track acks to confirm leadership
-            if not hasattr(self, 'pending_reads'):
-                self.pending_reads = []
-            if not hasattr(self, 'read_ack_peers'):
-                self.read_ack_peers = set()
-            if not hasattr(self, 'read_round_active'):
-                self.read_round_active = False
+                    
 
-            if self.read_round_active and msg.get('success'):
-                self.read_ack_peers.add(msg['src'])
-                if len(self.read_ack_peers) + 1 >= (len(NODE_IDS) // 2) + 1:
-                    self.read_round_active = False
-                # Serve reads whose read_index is covered
-                    still_pending = []
-                    to_serve = []
-                    for read_index, req in self.pending_reads:
-                        if self.last_applied >= read_index:
-                            to_serve.append((read_index, req))
-                        else:
-                            still_pending.append((read_index, req))
-                    self.pending_reads = still_pending
-                    kv_snapshot = dict(self.kv_store) 
-            
+            # Check pending reads — resolve any that now have majority acks
+            for req_id, read in list(self.pending_reads.items()):
+                read["acks"].add(msg['src'])
+                if len(read["acks"]) >= read["needed"]:
+                    reads_to_serve.append((req_id, read))
+                    del self.pending_reads[req_id]
+
         self.apply_committed()
 
-        for read_index, req in to_serve:
-            key = req.get('key')
-            client_id = req['src']
-            request_id = req.get('request_id')
-            cache_key = (client_id, request_id)
-            if key in kv_snapshot:
+        # Serve confirmed reads outside the lock
+        for req_id, read in reads_to_serve:
+            original_msg = read["msg"]
+            key = original_msg.get("key")
+            client_id = original_msg["src"]
+            cache_key = (client_id, req_id)
+
+            if key in self.kv_store:
                 response = make_client_response(
                     self.node_id, client_id,
-                    request_id=request_id,
+                    request_id=req_id,
                     success=True,
-                    value=kv_snapshot[key]
+                    value=self.kv_store[key]
                 )
             else:
                 response = make_client_response(
                     self.node_id, client_id,
-                    request_id=request_id,
+                    request_id=req_id,
                     success=False,
                     error=f"Key '{key}' not found"
                 )
-            with self.lock:
-                self.client_response_cache[cache_key] = response
+            self.client_response_cache[cache_key] = response
             self._send(response)
-            print(f"[{self.node_id}] Served linearisable GET key='{key}' at read_index={read_index}")
     # INSTALL SNAPSHOT
 
     def handle_install_snapshot(self, msg):
@@ -625,25 +614,15 @@ class RaftNode:
         # The entry will be applied later when it is committed. GET can still read directly from kv_store for now (linearisable reads are added in Part 4)
         # should handle multiple keys
 
-        # should handle overwriting an existing key (and DELETE)(ie if key already exists and client tries to put a new value for that key, should overwrite the value instead of returning an error)   
-        # got rid of the check for if not leader, as the brief said to ignore that for part 2 and just respond to the client for debugging purposes. The response is still sent through the network router, but it will be sent even if this node is not the leader.
-        #if self.role != LEADER:
-            # Redirect client to the current leader if not the leader
-            # response = make_client_response(
-                #self.node_id,
-                #msg['src'],  
-                #request_id=msg.get("request_id"),
-                #success=False,
-                #error="Not the leader",
-                #leader_hint=self.leader_id
-            #)
-            #self._send(response)
+        # should handle overwriting an existing key (and DELETE)(ie if key already exists and client tries to put a new value for that key, should overwrite the value instead of returning an error)  
             # return
         with self.lock:
             if not hasattr(self, 'client_response_cache'):
                 self.client_response_cache = {}
             if not hasattr(self, 'pending_requests'):
                 self.pending_requests = set()
+            if not hasattr(self, 'pending_reads'):
+                self.pending_reads = {}
 
         request_id = msg.get("request_id")
         client_id = msg["src"]
@@ -697,24 +676,14 @@ class RaftNode:
             return
 
         elif operation == "GET":
-            trigger_heartbeat = False
-            with self.lock:
-                if not hasattr(self, 'pending_reads'):
-                    self.pending_reads = []
-                if not hasattr(self, 'read_ack_peers'):
-                    self.read_ack_peers = set()
-                if not hasattr(self, 'read_round_active'):
-                    self.read_round_active = False
-
-                read_index = self.commit_index
-                self.pending_reads.append((read_index, msg))
-                if not self.read_round_active:
-                    self.read_round_active = True
-                    self.read_ack_peers = set()
-                    trigger_heartbeat = True
-            
-            if trigger_heartbeat:
-                self.send_heartbeats()
+            #trigger_heartbeat = False
+            self.pending_reads[request_id] = {
+                "msg": msg,
+                "acks": {self.node_id},  # leader counts itself
+                "needed": (len(NODE_IDS) // 2) + 1,
+                "commit_index": self.commit_index
+            }
+            self.send_heartbeats()
             return
             """
             if key in self.kv_store:
@@ -846,44 +815,6 @@ class RaftNode:
         self.last_applied = self.commit_index
         if len(self.log) > SNAPSHOT_THRESHOLD:
             self.take_snapshot()
-
-        if not hasattr(self, 'pending_reads'):
-            self.pending_reads = []
-        if not hasattr(self, 'read_round_active'):
-            self.read_round_active = False
-
-        if self.pending_reads and not self.read_round_active:
-            still_pending = []
-            to_serve = []
-            for read_index, req in self.pending_reads:
-                if self.last_applied >= read_index:
-                    to_serve.append((read_index, req))
-                else:
-                    still_pending.append((read_index, req))
-            self.pending_reads = still_pending
-            kv_snapshot = dict(self.kv_store)
-
-            for read_index, req in to_serve:
-                key = req.get('key')
-                client_id = req['src']
-                request_id = req.get('request_id')
-                cache_key = (client_id, request_id)
-                if key in kv_snapshot:
-                    response = make_client_response(
-                        self.node_id, client_id,
-                        request_id=request_id,
-                        success=True,
-                        value=kv_snapshot[key]
-                    )
-                else:
-                    response = make_client_response(
-                        self.node_id, client_id,
-                        request_id=request_id,
-                        success=False,
-                        error=f"Key '{key}' not found"
-                    )
-                self.client_response_cache[cache_key] = response
-                self._send(response)
 
     # CHECKPOINTING / SNAPSHOTTING (Part 3)
 
@@ -1024,9 +955,7 @@ class RaftNode:
         self.voted_for = None
         self.leader_id = None
         if hasattr(self, 'pending_reads'):
-            self.pending_reads = []
-        if hasattr(self, 'read_round_active'):
-            self.read_round_active = False
+            self.pending_reads = {}
         self.save_state()
 
 # ENTRY POINT
