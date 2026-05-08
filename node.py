@@ -324,6 +324,7 @@ class RaftNode:
                 # send snapshot directly instead of AppendEntries
                 snapshot = getattr(self, 'snapshot', None)
                 if snapshot and first_entry <= snapshot['last_included_index']:
+                    print(f"[{self.node_id}] Sending InstallSnapshot to {peer_id} (next_index={first_entry}, snapshot_index={snapshot['last_included_index']})")
                     install_msg = make_install_snapshot(
                         self.node_id,
                         peer_id,
@@ -337,7 +338,7 @@ class RaftNode:
 
                 if first_entry <=0:
                     entries_to_send = self.log
-                elif first_entry > len(self.log):
+                elif first_entry > self._get_last_log_index():
                     entries_to_send = []
                 else:    
                     # -1 so that the raft index is converted to python index (bacuse raft atarts at 1 and py at 0)
@@ -479,8 +480,13 @@ class RaftNode:
             if self.role != LEADER:
                 return
             
-            # added a bit of backtracking to handle failed append. simple not fully implemeted
+            # added a bit of backtracking to handle failed append.
             if not msg.get('success', False):
+                current_match = self.match_index.get(msg['src'], 0)
+                snapshot = getattr(self, 'snapshot', None)
+                # Don't backtrack past the snapshot point, already sent InstallSnapshot
+                if snapshot and current_match >= snapshot['last_included_index']:
+                    return  
                 #with self.lock:
                 self.next_index[msg['src']] = max(1, self.next_index.get(msg['src'], 1) - 1)
                 return
@@ -511,7 +517,7 @@ class RaftNode:
                     print(f"[{self.node_id}] COMMITTED index {index} with {count} votes")
                     
 
-            # Check pending reads — resolve any that now have majority acks
+            # Check pending reads resolve any that now have majority acks
             for req_id, read in list(self.pending_reads.items()):
                 read["acks"].add(msg['src'])
                 if len(read["acks"]) >= read["needed"]:
@@ -546,7 +552,7 @@ class RaftNode:
     # INSTALL SNAPSHOT
 
     def handle_install_snapshot(self, msg):
-        # Called from _receive_loop — no lock held on entry
+        # Called from _receive_loop, no lock held on entry
         if msg.get("term") < self.current_term:
             response = {
                 "type": MSG_INSTALL_SNAPSHOT_RESPONSE,
@@ -558,7 +564,7 @@ class RaftNode:
             self._send(response)
             return
         with self.lock:
-            # Valid snapshot from current leader — accept it
+            # Valid snapshot from current leader, accept it
             self.current_term = msg["term"]
             self.role = FOLLOWER
             self.leader_id = msg["src"]
@@ -604,7 +610,7 @@ class RaftNode:
 
     def handle_install_snapshot_response(self, msg):
         with self.lock:
-            # Called from _receive_loop — no lock held on entry
+            # Called from _receive_loop, no lock held on entry
             if msg["term"] > self.current_term:
                 self._step_down(msg["term"])
                 #self.election_timeout = self._random_election_timeout()
@@ -630,7 +636,6 @@ class RaftNode:
         # PUT/DELETE: append the operation to the Raft log as a new entry instead of writing directly to kv_store. 
         # The entry will be applied later when it is committed. GET can still read directly from kv_store for now (linearisable reads are added in Part 4)
         # should handle multiple keys
-
         # should handle overwriting an existing key (and DELETE)(ie if key already exists and client tries to put a new value for that key, should overwrite the value instead of returning an error)  
             # return
         with self.lock:
@@ -830,7 +835,7 @@ class RaftNode:
                 self._send(response)
         # To update the pointer  
         self.last_applied = self.commit_index
-        if len(self.log) > SNAPSHOT_THRESHOLD:
+        if len(self.log) >= SNAPSHOT_THRESHOLD:
             self.take_snapshot()
 
     # CHECKPOINTING / SNAPSHOTTING (Part 3)
