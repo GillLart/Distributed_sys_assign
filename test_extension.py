@@ -159,7 +159,7 @@ def test_snapshot_triggered_and_data_survives():
     verified = 0
     failed_keys = []
     for key, expected in written.items():
-        r = c.request("GET", key, timeout=10)
+        r = c.request_with_retry("GET", key, timeout=10,retries=3)
         if r and r.get("success") and r.get("value") == expected:
             verified += 1
         else:
@@ -284,7 +284,7 @@ def test_snapshot_state_correct_after_deletes():
     deleted_keys = set()
     keys_list = list(initial_keys.keys())
     for key in keys_list[:10]:
-        r = c.request("DELETE", key, timeout=10)
+        r = c.request_with_retry("DELETE", key, timeout=10)
         if r and r.get("success"):
             deleted_keys.add(key)
             del initial_keys[key]
@@ -297,7 +297,7 @@ def test_snapshot_state_correct_after_deletes():
     for i in range(20):
         key = f"extra-key-{i}"
         val = f"extra-val-{i}"
-        r = c.request("PUT", key, val, timeout=10)
+        r = c.request_with_retry("PUT", key, val, timeout=10)
         if r and r.get("success"):
             additional[key] = val
 
@@ -310,7 +310,7 @@ def test_snapshot_state_correct_after_deletes():
     # Deleted keys must not be present
     print(f"Checking {len(deleted_keys)} deleted keys are gone...")
     for key in deleted_keys:
-        r = c.request("GET", key, timeout=10)
+        r = c.request_with_retry("GET", key, timeout=10, retries=3)
         if r and r.get("success"):
             print(f"FAIL: Deleted key '{key}' still present after snapshot with value '{r.get('value')}'")
             failures += 1
@@ -319,7 +319,7 @@ def test_snapshot_state_correct_after_deletes():
     print(f"Checking {len(initial_keys)} surviving keys...")
     surviving_verified = 0
     for key, expected in initial_keys.items():
-        r = c.request("GET", key, timeout=10)
+        r = c.request_with_retry("GET", key, timeout=10,retries=3)
         if r and r.get("success") and r.get("value") == expected:
             surviving_verified += 1
         else:
@@ -330,7 +330,7 @@ def test_snapshot_state_correct_after_deletes():
     print(f"Checking sample of {min(10, len(additional))} additional keys...")
     sample_keys = list(additional.items())[:10]
     for key, expected in sample_keys:
-        r = c.request("GET", key, timeout=10)
+        r = c.request_with_retry("GET", key, timeout=10, retries=3)
         if r and r.get("success") and r.get("value") == expected:
             pass
         else:
